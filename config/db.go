@@ -15,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"golang.org/x/crypto/bcrypt"
 )
 
 var DB *mongo.Database
@@ -88,13 +89,18 @@ func seedData() {
 
 	fmt.Println("Seeding default database records...")
 
+	hashPassword := func(pw string) string {
+		h, _ := bcrypt.GenerateFromPassword([]byte(pw), bcrypt.DefaultCost)
+		return string(h)
+	}
+
 	// 1. Create Admin
 	adminID := primitive.NewObjectID()
 	adminUser := model.User{
 		ID:        adminID,
 		Name:      "Administrator System",
 		Email:     "admin@vendora.com",
-		Password:  "admin123",
+		Password:  hashPassword("admin123"),
 		Role:      "admin",
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}
@@ -106,7 +112,7 @@ func seedData() {
 		ID:        sellerID,
 		Name:      "Nabila Store Official",
 		Email:     "seller@vendora.com",
-		Password:  "seller123",
+		Password:  hashPassword("seller123"),
 		Role:      "seller",
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}
@@ -118,7 +124,7 @@ func seedData() {
 		ID:        buyerID,
 		Name:      "Nabila Buyer",
 		Email:     "buyer@vendora.com",
-		Password:  "buyer123",
+		Password:  hashPassword("buyer123"),
 		Role:      "buyer",
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}

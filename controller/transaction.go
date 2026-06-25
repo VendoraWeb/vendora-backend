@@ -65,19 +65,21 @@ func Checkout(c *fiber.Ctx) error {
 			return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found: "+item.ProductID)
 		}
 
-		if product.Stock < item.Quantity {
-			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Insufficient stock for product: "+product.Name)
+		// Deduct stock atomically with verification to prevent race conditions
+		filter := bson.M{
+			"_id":   prodOID,
+			"stock": bson.M{"$gte": item.Quantity}, // Ensure stock is sufficient
 		}
-
-		// Deduct stock
-		newStock := product.Stock - item.Quantity
-		_, err = config.DB.Collection("products").UpdateOne(
-			context.Background(),
-			bson.M{"_id": prodOID},
-			bson.M{"$set": bson.M{"stock": newStock}},
-		)
+		update := bson.M{
+			"$inc": bson.M{"stock": -item.Quantity}, // Deduct quantity
+		}
+		res, err := config.DB.Collection("products").UpdateOne(context.Background(), filter, update)
 		if err != nil {
 			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to update stock for product: "+product.Name)
+		}
+
+		if res.MatchedCount == 0 {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Insufficient stock for product: "+product.Name)
 		}
 
 		itemTotal := product.Price * float64(item.Quantity)

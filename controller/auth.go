@@ -12,6 +12,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type RegisterReq struct {
@@ -56,11 +57,16 @@ func Register(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusConflict, "Email already registered")
 	}
 
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to hash password")
+	}
+
 	newUser := model.User{
 		ID:        primitive.NewObjectID(),
 		Name:      req.Name,
 		Email:     req.Email,
-		Password:  req.Password, // In production, hash this password (e.g. bcrypt)
+		Password:  string(hashedPassword),
 		Role:      req.Role,
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}
@@ -96,8 +102,9 @@ func Login(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database error")
 	}
 
-	// Compare plaintext password for simplicity (or bcrypt in production)
-	if user.Password != req.Password {
+	// Compare hashed password using bcrypt
+	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password))
+	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusUnauthorized, "Invalid email or password")
 	}
 

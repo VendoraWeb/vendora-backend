@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"log"
 	"time"
 
 	"vendora/config"
@@ -68,6 +69,16 @@ func RentShop(c *fiber.Ctx) error {
 	_, err = config.DB.Collection("shops").InsertOne(context.Background(), newShop)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to register/rent shop space")
+	}
+
+	// Update data user di collection 'users' agar has_shop = true dan shop_id terisi
+	_, err = config.DB.Collection("users").UpdateOne(
+		context.Background(),
+		bson.M{"_id": ownerOID},
+		bson.M{"$set": bson.M{"has_shop": true, "shop_id": newShop.ID}},
+	)
+	if err != nil {
+		log.Printf("Gagal memperbarui status toko user: %v", err)
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusCreated, "Shop rented successfully! Space allocated.", newShop)
