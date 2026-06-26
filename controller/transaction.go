@@ -65,6 +65,13 @@ func Checkout(c *fiber.Ctx) error {
 			return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found: "+item.ProductID)
 		}
 
+		// Prevent sellers from purchasing products from their own shop
+		if buyer.Role == "seller" && buyer.HasShop {
+			if product.ShopID == buyer.ShopID {
+				return helper.ErrorResponse(c, fiber.StatusBadRequest, "Cannot checkout: You cannot purchase products from your own shop")
+			}
+		}
+
 		// Deduct stock atomically with verification to prevent race conditions
 		filter := bson.M{
 			"_id":   prodOID,
@@ -98,7 +105,7 @@ func Checkout(c *fiber.Ctx) error {
 		BuyerID:     buyerOID,
 		Items:       transactionItems,
 		TotalAmount: totalAmount,
-		Status:      "pending_payment",
+		Status:      "success",
 		CreatedAt:   primitive.NewDateTimeFromTime(time.Now()),
 	}
 
@@ -115,6 +122,56 @@ func ListTransactions(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
 	}
 
+	// If shop_id is provided, find all product IDs belonging to that shop first
+	shopID := c.Query("shop_id")
+	if shopID != "" {
+		shopOID, err := primitive.ObjectIDFromHex(shopID)
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid shop_id format")
+		}
+
+		// Get all product IDs from this shop
+		prodCursor, err := config.DB.Collection("products").Find(
+			context.Background(),
+			bson.M{"shop_id": shopOID},
+		)
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve shop products")
+		}
+		defer prodCursor.Close(context.Background())
+
+		var products []struct {
+			ID primitive.ObjectID `bson:"_id"`
+		}
+		if err = prodCursor.All(context.Background(), &products); err != nil {
+			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding products")
+		}
+
+		productIDs := make([]primitive.ObjectID, 0, len(products))
+		for _, p := range products {
+			productIDs = append(productIDs, p.ID)
+		}
+
+		// Find all transactions that contain at least one product from this shop
+		filter := bson.M{
+			"items.product_id": bson.M{"$in": productIDs},
+		}
+
+		cursor, err := config.DB.Collection("transactions").Find(context.Background(), filter)
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve transactions")
+		}
+		defer cursor.Close(context.Background())
+
+		var transactions []model.Transaction = []model.Transaction{}
+		if err = cursor.All(context.Background(), &transactions); err != nil {
+			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding transactions list")
+		}
+
+		return helper.SuccessResponse(c, fiber.StatusOK, "Transactions retrieved successfully", transactions)
+	}
+
+	// Default: filter by buyer_id if provided
 	filter := bson.M{}
 	buyerID := c.Query("buyer_id")
 	if buyerID != "" {
@@ -136,4 +193,27 @@ func ListTransactions(c *fiber.Ctx) error {
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Transactions retrieved successfully", transactions)
+}
+
+// FixTransactionStatus updates all pending_payment transactions to success (one-time migration)
+func FixTransactionStatus(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	result, err := config.DB.Collection("transactions").UpdateMany(
+		ctx,
+		bson.M{"status": "pending_payment"},
+		bson.M{"$set": bson.M{"status": "success"}},
+	)
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to update transactions")
+	}
+
+	return helper.SuccessResponse(c, fiber.StatusOK, "Transactions updated successfully", fiber.Map{
+		"updated_count": result.ModifiedCount,
+	})
 }
