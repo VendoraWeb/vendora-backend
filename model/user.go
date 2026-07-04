@@ -10,7 +10,9 @@ type User struct {
 	Role      string             `bson:"role" json:"role"`   // admin, seller, buyer
 	HasShop   bool               `bson:"has_shop" json:"has_shop"`
 	ShopID    primitive.ObjectID `bson:"shop_id,omitempty" json:"shop_id,omitempty"`
+	ShopName  string             `bson:"shop_name,omitempty" json:"shop_name,omitempty"`
 	Phone     string             `bson:"phone" json:"phone"`
 	Address   string             `bson:"address" json:"address"`
+	Avatar    string             `bson:"avatar" json:"avatar"`
 	CreatedAt primitive.DateTime `bson:"created_at" json:"created_at"`
 }

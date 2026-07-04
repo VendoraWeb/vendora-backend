@@ -20,6 +20,7 @@ type RegisterReq struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
 	Role     string `json:"role"` // admin, seller, buyer
+	ShopName string `json:"shop_name"`
 }
 
 type LoginReq struct {
@@ -68,6 +69,7 @@ func Register(c *fiber.Ctx) error {
 		Email:     req.Email,
 		Password:  string(hashedPassword),
 		Role:      req.Role,
+		ShopName:  req.ShopName,
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}
 

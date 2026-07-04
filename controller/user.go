@@ -15,8 +15,10 @@ import (
 
 type UpdateProfileReq struct {
 	UserID  string `json:"user_id"`
+	Email   string `json:"email"`
 	Phone   string `json:"phone"`
 	Address string `json:"address"`
+	Avatar  string `json:"avatar"`
 }
 
 func UpdateProfile(c *fiber.Ctx) error {
@@ -40,8 +42,10 @@ func UpdateProfile(c *fiber.Ctx) error {
 
 	update := bson.M{
 		"$set": bson.M{
+			"email":   req.Email,
 			"phone":   req.Phone,
 			"address": req.Address,
+			"avatar":  req.Avatar,
 		},
 	}
 
@@ -55,8 +59,10 @@ func UpdateProfile(c *fiber.Ctx) error {
 	return c.JSON(fiber.Map{
 		"message": "Profile updated successfully",
 		"data": map[string]string{
+			"email":   req.Email,
 			"phone":   req.Phone,
 			"address": req.Address,
+			"avatar":  req.Avatar,
 		},
 	})
 }

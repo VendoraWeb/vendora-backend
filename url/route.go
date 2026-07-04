@@ -29,6 +29,7 @@ func SetupRoutes(app *fiber.App) {
 	api.Get("/shops", controller.ListShops)
 	api.Put("/shop/:id/status", controller.UpdateShopStatus)
 	api.Put("/shop/:id/renew", controller.RenewShop)
+	api.Delete("/shop/:id", controller.DeleteShop)
 
 	// Product routes
 	api.Post("/product", controller.AddProduct)
@@ -46,4 +47,9 @@ func SetupRoutes(app *fiber.App) {
 	api.Post("/tickets", controller.CreateTicket)
 	api.Get("/tickets", controller.ListTickets)
 	api.Put("/ticket/:id/reply", controller.ReplyTicket)
+
+	// Chat routes
+	api.Post("/chat/send", controller.SendMessage)
+	api.Get("/chat/history", controller.GetChatHistory)
+	api.Get("/chat/inbox", controller.GetSellerInbox)
 }

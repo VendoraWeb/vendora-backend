@@ -106,9 +106,11 @@ func ListShops(c *fiber.Ctx) error {
 		err = config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": s.OwnerID}).Decode(&owner)
 		phone := ""
 		address := ""
+		avatar := ""
 		if err == nil {
 			phone = owner.Phone
 			address = owner.Address
+			avatar = owner.Avatar
 		}
 		responseShops = append(responseShops, fiber.Map{
 			"id":             s.ID,
@@ -121,6 +123,7 @@ func ListShops(c *fiber.Ctx) error {
 			"created_at":     s.CreatedAt,
 			"owner_phone":    phone,
 			"owner_address":  address,
+			"owner_avatar":   avatar,
 		})
 	}
 
@@ -227,6 +230,48 @@ func RenewShop(c *fiber.Ctx) error {
 		"new_expiry":      newExpiry.Format("2006-01-02"),
 		"additional_cost": additionalCost,
 	})
+}
+
+// DeleteShop permanently removes a shop (admin only)
+func DeleteShop(c *fiber.Ctx) error {
+	shopID := c.Params("id")
+	if shopID == "" {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Shop ID param is required")
+	}
+
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+
+	oid, err := primitive.ObjectIDFromHex(shopID)
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Shop ID format")
+	}
+
+	// Fetch shop to get owner_id before deleting
+	var shop model.Shop
+	err = config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&shop)
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+
+	result, err := config.DB.Collection("shops").DeleteOne(context.Background(), bson.M{"_id": oid})
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to delete shop")
+	}
+
+	if result.DeletedCount == 0 {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+
+	// Update user to remove has_shop flag
+	config.DB.Collection("users").UpdateOne(
+		context.Background(),
+		bson.M{"_id": shop.OwnerID},
+		bson.M{"$set": bson.M{"has_shop": false, "shop_id": primitive.NilObjectID}},
+	)
+
+	return helper.SuccessResponse(c, fiber.StatusOK, "Shop deleted successfully", nil)
 }
 
 
