@@ -42,6 +42,7 @@ func SetupRoutes(app *fiber.App) {
 	api.Post("/checkout", controller.Checkout)
 	api.Get("/transactions", controller.ListTransactions)
 	api.Post("/fix-tx", controller.FixTransactionStatus)
+	api.Put("/transaction/:id/status", controller.UpdateTransactionStatus)
 
 	// Ticket / CS Support routes
 	api.Post("/tickets", controller.CreateTicket)

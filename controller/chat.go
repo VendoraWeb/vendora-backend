@@ -102,7 +102,7 @@ func GetChatHistory(c *fiber.Ctx) error {
 
 	filter := bson.M{
 		"shop_id": shopOID,
-		"": []bson.M{
+		"$or": []bson.M{
 			{"sender_id": buyerOID, "receiver_id": ownerOID},
 			{"sender_id": ownerOID, "receiver_id": buyerOID},
 		},
@@ -148,45 +148,44 @@ func GetSellerInbox(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// Aggregation to find all unique buyers who interacted with this shop
-	pipeline := []bson.M{
-		{"$match": bson.M{"shop_id": shopOID}},
-		{"$sort": bson.M{"created_at": -1}},
-		{"$group": bson.M{
-			"_id": bson.M{
-				"$cond": []interface{}{
-					bson.M{"$eq": []interface{}{"$sender_id", ownerOID}},
-					"$receiver_id",
-					"$sender_id",
-				},
-			},
-			"last_message": bson.M{"$first": "$text"},
-			"updated_at":   bson.M{"$first": "$created_at"},
-		}},
+	var shop model.Shop
+	if err := config.DB.Collection("shops").FindOne(ctx, bson.M{"_id": shopOID}).Decode(&shop); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
 	}
-	
-	cursor, err := config.DB.Collection("messages").Aggregate(ctx, pipeline)
+	ownerOID := shop.OwnerID
+
+	// Fetch all messages for this shop
+	opts := options.Find().SetSort(bson.M{"created_at": -1}) // sort newest first
+	cursor, err := config.DB.Collection("messages").Find(ctx, bson.M{"shop_id": shopOID}, opts)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to fetch inbox")
 	}
 	defer cursor.Close(ctx)
 
-	var results []bson.M
-	if err = cursor.All(ctx, &results); err != nil {
+	var messages []model.Message
+	if err = cursor.All(ctx, &messages); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to parse inbox")
 	}
 
-	var shop model.Shop
-	config.DB.Collection("shops").FindOne(ctx, bson.M{"_id": shopOID}).Decode(&shop)
-	ownerOID := shop.OwnerID
+	// Group in memory
+	grouped := make(map[primitive.ObjectID]model.Message)
+	for _, msg := range messages {
+		var otherID primitive.ObjectID
+		if msg.SenderID == ownerOID {
+			otherID = msg.ReceiverID
+		} else {
+			otherID = msg.SenderID
+		}
+		
+		// Since we sorted by newest first, the first time we see this otherID, it's their latest message
+		if _, exists := grouped[otherID]; !exists {
+			grouped[otherID] = msg
+		}
+	}
 
 	var inbox []ChatInboxItem
-	for _, res := range results {
-		buyerID := res["_id"].(primitive.ObjectID)
-		// Skip if the grouped ID is the owner themselves (edge case if owner messaged themselves)
-		if buyerID == ownerOID {
-			continue
-		}
+	for buyerID, lastMsg := range grouped {
+		// We don't skip if buyerID == ownerOID, in case they are testing with their own account
 		
 		var buyer model.User
 		config.DB.Collection("users").FindOne(ctx, bson.M{"_id": buyerID}).Decode(&buyer)
@@ -195,8 +194,8 @@ func GetSellerInbox(c *fiber.Ctx) error {
 			BuyerID:     buyerID,
 			BuyerName:   buyer.Name,
 			BuyerAvatar: buyer.Avatar,
-			LastMsg:     res["last_message"].(string),
-			UpdatedAt:   res["updated_at"].(primitive.DateTime),
+			LastMsg:     lastMsg.Text,
+			UpdatedAt:   lastMsg.CreatedAt,
 		})
 	}
 	
@@ -206,3 +205,4 @@ func GetSellerInbox(c *fiber.Ctx) error {
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Inbox retrieved", inbox)
 }
+
