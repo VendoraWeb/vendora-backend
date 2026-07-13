@@ -48,7 +48,8 @@ func ConnectDB() {
 
 	mongoURI := os.Getenv("MONGO_URI")
 	if mongoURI == "" {
-		mongoURI = "mongodb://localhost:27017"
+		fmt.Println("WARNING: MONGO_URI is empty, skipping DB connection to avoid timeout.")
+		return
 	}
 
 	dbName := os.Getenv("DB_NAME")
