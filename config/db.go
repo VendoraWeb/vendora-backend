@@ -61,13 +61,15 @@ func ConnectDB() {
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
 	if err != nil {
-		log.Fatalf("Failed to connect to MongoDB: %v", err)
+		fmt.Printf("WARNING: Failed to connect to MongoDB: %v\n", err)
+		return
 	}
 
 	// Ping database
 	err = client.Ping(ctx, nil)
 	if err != nil {
-		log.Fatalf("Failed to ping MongoDB: %v", err)
+		fmt.Printf("WARNING: Failed to ping MongoDB: %v\n", err)
+		return
 	}
 
 	fmt.Println("Successfully connected to MongoDB!")
