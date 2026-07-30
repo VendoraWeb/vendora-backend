@@ -5,10 +5,10 @@
       "use": "@vercel/go"
     }
   ],
-  "routes": [
+  "rewrites": [
     {
-      "src": "/api/(.*)",
-      "dest": "/api/index.go"
+      "source": "/api/(.*)",
+      "destination": "/api/index.go"
     }
   ]
 }
