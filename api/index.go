@@ -40,5 +40,11 @@ func init() {
 
 // Handler is the entrypoint for Vercel Serverless Function
 func Handler(w http.ResponseWriter, r *http.Request) {
+	// Reconstruct the RequestURI to ensure Fiber adaptor doesn't lose the query string on Vercel
+	if r.URL.RawQuery != "" {
+		r.RequestURI = r.URL.Path + "?" + r.URL.RawQuery
+	} else {
+		r.RequestURI = r.URL.Path
+	}
 	handler(w, r)
 }
