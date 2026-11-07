@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"vendora/config"
@@ -14,12 +15,60 @@ import (
 )
 
 type ProductReq struct {
-	ShopID      string   `json:"shop_id"`
-	Name        string   `json:"name"`
-	Description string   `json:"description"`
-	Price       float64  `json:"price"`
-	Stock       int      `json:"stock"`
-	Images      []string `json:"images"`
+	ShopID      string               `json:"shop_id"`
+	Name        string               `json:"name"`
+	Description string               `json:"description"`
+	Category    *string              `json:"category"`
+	Subcategory *string              `json:"subcategory"`
+	Price       float64              `json:"price"`
+	Stock       *int                 `json:"stock"`
+	Images      []string             `json:"images"`
+	Options     *[]model.OptionGroup `json:"options"`    // dikirim = diganti; [] = hapus semua variasi
+	Specs       *[]model.Spec        `json:"specs"`      // dikirim = diganti
+	SizeGuide   *model.SizeGuide     `json:"size_guide"` // kolom kosong = hapus panduan ukuran
+}
+
+const (
+	maxOptionGroups = 3
+	maxOptionValues = 12
+)
+
+// cleanOptions merapikan variasi dari penjual: buang label kosong/duplikat,
+// batasi jumlah, dan tolak tambahan harga negatif yang membuat harga <= 0.
+func cleanOptions(groups []model.OptionGroup, basePrice float64) ([]model.OptionGroup, string) {
+	out := []model.OptionGroup{}
+	for _, g := range groups {
+		g.Name = strings.TrimSpace(g.Name)
+		if g.Name == "" {
+			continue
+		}
+		seen := map[string]bool{}
+		vals := []model.OptionValue{}
+		for _, v := range g.Values {
+			v.Label = strings.TrimSpace(v.Label)
+			key := strings.ToLower(v.Label)
+			if v.Label == "" || seen[key] {
+				continue
+			}
+			if basePrice > 0 && basePrice+v.PriceDelta <= 0 {
+				return nil, "Tambahan harga variasi \"" + v.Label + "\" membuat harga jadi nol atau minus"
+			}
+			seen[key] = true
+			vals = append(vals, v)
+		}
+		if len(vals) == 0 {
+			continue
+		}
+		if len(vals) > maxOptionValues {
+			return nil, "Maksimal 12 pilihan untuk variasi " + g.Name
+		}
+		g.Values = vals
+		out = append(out, g)
+	}
+	if len(out) > maxOptionGroups {
+		return nil, "Maksimal 3 jenis variasi per produk"
+	}
+	return out, ""
 }
 
 func AddProduct(c *fiber.Ctx) error {
@@ -28,7 +77,11 @@ func AddProduct(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
 	}
 
-	if req.ShopID == "" || req.Name == "" || req.Price <= 0 || req.Stock < 0 {
+	stock := 0
+	if req.Stock != nil {
+		stock = *req.Stock
+	}
+	if req.ShopID == "" || strings.TrimSpace(req.Name) == "" || req.Price <= 0 || stock < 0 {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "ShopID, Name, positive Price and valid Stock are required")
 	}
 
@@ -55,12 +108,31 @@ func AddProduct(c *fiber.Ctx) error {
 	newProduct := model.Product{
 		ID:          primitive.NewObjectID(),
 		ShopID:      shopOID,
-		Name:        req.Name,
+		Name:        strings.TrimSpace(req.Name),
 		Description: req.Description,
 		Price:       req.Price,
-		Stock:       req.Stock,
+		Stock:       stock,
 		Images:      req.Images,
 		CreatedAt:   primitive.NewDateTimeFromTime(time.Now()),
+	}
+	if req.Category != nil {
+		newProduct.Category = strings.TrimSpace(*req.Category)
+	}
+	if req.Subcategory != nil {
+		newProduct.Subcategory = strings.TrimSpace(*req.Subcategory)
+	}
+	if req.Options != nil {
+		opts, msg := cleanOptions(*req.Options, req.Price)
+		if msg != "" {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, msg)
+		}
+		newProduct.Options = opts
+	}
+	if req.Specs != nil {
+		newProduct.Specs = *req.Specs
+	}
+	if req.SizeGuide != nil && len(req.SizeGuide.Columns) > 0 {
+		newProduct.SizeGuide = req.SizeGuide
 	}
 
 	_, err = config.DB.Collection("products").InsertOne(context.Background(), newProduct)
@@ -160,8 +232,9 @@ func UpdateProduct(c *fiber.Ctx) error {
 	}
 
 	updateFields := bson.M{}
-	if req.Name != "" {
-		updateFields["name"] = req.Name
+	unsetFields := bson.M{}
+	if strings.TrimSpace(req.Name) != "" {
+		updateFields["name"] = strings.TrimSpace(req.Name)
 	}
 	if req.Description != "" {
 		updateFields["description"] = req.Description
@@ -169,21 +242,67 @@ func UpdateProduct(c *fiber.Ctx) error {
 	if req.Price > 0 {
 		updateFields["price"] = req.Price
 	}
-	if req.Stock >= 0 {
-		updateFields["stock"] = req.Stock
+	// Stok hanya diubah bila dikirim — sebelumnya stok jadi 0 saat field tidak ada
+	if req.Stock != nil && *req.Stock >= 0 {
+		updateFields["stock"] = *req.Stock
 	}
 	if len(req.Images) > 0 {
 		updateFields["images"] = req.Images
 	}
+	if req.Category != nil {
+		updateFields["category"] = strings.TrimSpace(*req.Category)
+	}
+	if req.Subcategory != nil {
+		updateFields["subcategory"] = strings.TrimSpace(*req.Subcategory)
+	}
+	if req.Options != nil {
+		price := req.Price
+		if price <= 0 {
+			var current model.Product
+			if err := config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&current); err == nil {
+				price = current.Price
+			}
+		}
+		opts, msg := cleanOptions(*req.Options, price)
+		if msg != "" {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, msg)
+		}
+		if len(opts) == 0 {
+			unsetFields["options"] = ""
+		} else {
+			updateFields["options"] = opts
+		}
+	}
+	if req.Specs != nil {
+		if len(*req.Specs) == 0 {
+			unsetFields["specs"] = ""
+		} else {
+			updateFields["specs"] = *req.Specs
+		}
+	}
+	if req.SizeGuide != nil {
+		if len(req.SizeGuide.Columns) == 0 {
+			unsetFields["size_guide"] = ""
+		} else {
+			updateFields["size_guide"] = req.SizeGuide
+		}
+	}
 
-	if len(updateFields) == 0 {
+	if len(updateFields) == 0 && len(unsetFields) == 0 {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "No fields to update")
 	}
 
+	update := bson.M{}
+	if len(updateFields) > 0 {
+		update["$set"] = updateFields
+	}
+	if len(unsetFields) > 0 {
+		update["$unset"] = unsetFields
+	}
 	result, err := config.DB.Collection("products").UpdateOne(
 		context.Background(),
 		bson.M{"_id": oid},
-		bson.M{"$set": updateFields},
+		update,
 	)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to update product")

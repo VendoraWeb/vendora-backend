@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"regexp"
+	"strings"
 	"time"
 
 	"vendora/config"
@@ -11,111 +13,87 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
 	"golang.org/x/crypto/bcrypt"
 )
 
 type RegisterReq struct {
 	Name     string `json:"name"`
 	Email    string `json:"email"`
+	Phone    string `json:"phone"` // opsional, untuk OTP lewat WhatsApp/SMS
 	Password string `json:"password"`
-	Role     string `json:"role"` // admin, seller, buyer
+	Role     string `json:"role"` // seller | buyer
 	ShopName string `json:"shop_name"`
-}
-
-type LoginReq struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
 }
 
 func Register(c *fiber.Ctx) error {
 	var req RegisterReq
 	if err := c.BodyParser(&req); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
 
+	req.Name = strings.TrimSpace(req.Name)
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 	if req.Name == "" || req.Email == "" || req.Password == "" || req.Role == "" {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "All fields (name, email, password, role) are required")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Nama, email, kata sandi, dan peran wajib diisi")
+	}
+	if !helper.IsEmail(req.Email) {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Format email belum benar")
+	}
+	if len(req.Password) < minPasswordChars {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Kata sandi minimal 8 karakter")
+	}
+	// Pendaftaran publik hanya untuk pembeli & penjual — akun admin tidak boleh dibuat dari luar.
+	if req.Role != "seller" && req.Role != "buyer" {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Peran harus pembeli atau penjual")
 	}
 
-	if req.Role != "admin" && req.Role != "seller" && req.Role != "buyer" {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Role must be admin, seller, or buyer")
+	phoneE164 := ""
+	if strings.TrimSpace(req.Phone) != "" {
+		phoneE164 = helper.NormalizePhone(req.Phone)
+		if phoneE164 == "" {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Nomor HP belum benar. Contoh: 0812 3456 7890")
+		}
 	}
 
-	// Check if DB is initialized
 	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
 	}
 
-	collection := config.DB.Collection("users")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	// Check if email already exists
-	var existingUser model.User
-	err := collection.FindOne(ctx, bson.M{"email": req.Email}).Decode(&existingUser)
-	if err == nil {
-		return helper.ErrorResponse(c, fiber.StatusConflict, "Email already registered")
+	// Email unik (tidak peka huruf besar/kecil)
+	emailFilter := bson.M{"email": bson.M{"$regex": "^" + regexp.QuoteMeta(req.Email) + "$", "$options": "i"}}
+	if n, _ := usersCol().CountDocuments(ctx, emailFilter); n > 0 {
+		return helper.ErrorResponse(c, fiber.StatusConflict, "Email sudah terdaftar")
+	}
+	// Nomor HP unik
+	if phoneE164 != "" {
+		if existing, _ := findUsersByIdentifier(ctx, phoneE164); len(existing) > 0 {
+			return helper.ErrorResponse(c, fiber.StatusConflict, "Nomor HP sudah dipakai akun lain")
+		}
 	}
 
 	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to hash password")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal mengamankan kata sandi")
 	}
 
 	newUser := model.User{
 		ID:        primitive.NewObjectID(),
 		Name:      req.Name,
 		Email:     req.Email,
+		Phone:     strings.TrimSpace(req.Phone),
+		PhoneE164: phoneE164,
 		Password:  string(hashedPassword),
 		Role:      req.Role,
 		ShopName:  req.ShopName,
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}
 
-	_, err = collection.InsertOne(ctx, newUser)
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to register user")
+	if _, err = usersCol().InsertOne(ctx, newUser); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal mendaftarkan akun")
 	}
 
-	return helper.SuccessResponse(c, fiber.StatusCreated, "User registered successfully", newUser)
-}
-
-func Login(c *fiber.Ctx) error {
-	var req LoginReq
-	if err := c.BodyParser(&req); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
-	}
-
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
-	}
-
-	collection := config.DB.Collection("users")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	var user model.User
-	err := collection.FindOne(ctx, bson.M{"email": req.Email}).Decode(&user)
-	if err != nil {
-		if err == mongo.ErrNoDocuments {
-			return helper.ErrorResponse(c, fiber.StatusUnauthorized, "Invalid email or password")
-		}
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database error")
-	}
-
-	// Compare hashed password using bcrypt
-	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password))
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusUnauthorized, "Invalid email or password")
-	}
-
-	// In a real application, you'd generate a JWT token here.
-	// For this boilerplate, we'll return the user info and a mock token.
-	response := fiber.Map{
-		"token": "mock-jwt-token-for-" + user.Email,
-		"user":  user,
-	}
-
-	return helper.SuccessResponse(c, fiber.StatusOK, "Login successful", response)
+	return helper.SuccessResponse(c, fiber.StatusCreated, "Akun berhasil dibuat", newUser)
 }

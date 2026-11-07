@@ -8,6 +8,9 @@ import (
 )
 
 func SetupRoutes(app *fiber.App) {
+	controller.EnsureOTPIndexes()
+	controller.EnsureChatIndexes()
+
 	// Enable CORS for frontend access
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
@@ -19,7 +22,13 @@ func SetupRoutes(app *fiber.App) {
 
 	// Auth & User routes
 	api.Post("/register", controller.Register)
-	api.Post("/login", controller.Login)
+	api.Post("/login", controller.Login) // email/nomor HP + kata sandi
+
+	// OTP (login & reset kata sandi)
+	api.Post("/auth/otp/send", controller.SendOTP)
+	api.Post("/auth/otp/verify", controller.VerifyOTP)
+	api.Post("/auth/reset/start", controller.ResetStart)
+	api.Post("/auth/reset/complete", controller.ResetComplete)
 	api.Put("/user/profile", controller.UpdateProfile)
 	api.Get("/users", controller.ListUsers)
 	api.Put("/user/:id/ban", controller.BanUser)
@@ -50,7 +59,10 @@ func SetupRoutes(app *fiber.App) {
 	api.Put("/ticket/:id/reply", controller.ReplyTicket)
 
 	// Chat routes
-	api.Post("/chat/send", controller.SendMessage)
+	api.Post("/chat/send", controller.SendMessage) // teks dan/atau foto
+	api.Post("/chat/read", controller.MarkChatRead)
+	api.Get("/chat/unread", controller.GetChatUnread)
+	api.Get("/chat/media/:id", controller.GetChatMedia)
 	api.Get("/chat/history", controller.GetChatHistory)
 	api.Get("/chat/inbox", controller.GetSellerInbox)
 }

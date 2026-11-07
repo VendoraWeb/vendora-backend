@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"vendora/config"
@@ -14,9 +15,45 @@ import (
 )
 
 type CheckoutItem struct {
-	ProductID string `json:"product_id"`
-	ShopID    string `json:"shop_id"`
-	Quantity  int    `json:"quantity"`
+	ProductID string            `json:"product_id"`
+	ShopID    string            `json:"shop_id"`
+	Quantity  int               `json:"quantity"`
+	Options   map[string]string `json:"options"` // variasi terpilih, mis. {"Warna":"Burgundy","Kapasitas":"512 GB"}
+}
+
+// resolveVariant mencocokkan pilihan pembeli dengan variasi produk.
+// Harga dihitung di server (harga dasar + tambahan tiap pilihan), bukan dari browser.
+func resolveVariant(p model.Product, chosen map[string]string) (price float64, label string, image string, errMsg string) {
+	price = p.Price
+	if len(p.Images) > 0 {
+		image = p.Images[0]
+	}
+	if len(p.Options) == 0 {
+		return price, "", image, ""
+	}
+	labels := []string{}
+	for _, g := range p.Options {
+		want := strings.TrimSpace(chosen[g.Name])
+		if want == "" {
+			return 0, "", "", "Pilih " + strings.ToLower(g.Name) + " untuk " + p.Name + " dulu"
+		}
+		found := false
+		for _, v := range g.Values {
+			if strings.EqualFold(v.Label, want) {
+				price += v.PriceDelta
+				labels = append(labels, v.Label)
+				if v.Image != "" {
+					image = v.Image
+				}
+				found = true
+				break
+			}
+		}
+		if !found {
+			return 0, "", "", g.Name + " \"" + want + "\" tidak tersedia untuk " + p.Name
+		}
+	}
+	return price, strings.Join(labels, ", "), image, ""
 }
 
 type CheckoutReq struct {
@@ -59,7 +96,11 @@ func Checkout(c *fiber.Ctx) error {
 	for _, item := range req.Items {
 		var product model.Product
 		var prodOID primitive.ObjectID
-		
+		if item.Quantity < 1 {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Jumlah barang minimal 1")
+		}
+		unitPrice, variant, image := 0.0, "", ""
+
 		var err error
 		prodOID, err = primitive.ObjectIDFromHex(item.ProductID)
 		if err != nil || (len(item.ProductID) > 0 && item.ProductID[0] == 'm') {
@@ -69,10 +110,16 @@ func Checkout(c *fiber.Ctx) error {
 				Name:  "Produk Mockup (" + item.ProductID + ")",
 				Price: 10000000,
 			}
+			unitPrice = product.Price
 		} else {
 			err = config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": prodOID}).Decode(&product)
 			if err != nil {
 				return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found: "+item.ProductID)
+			}
+			var msg string
+			unitPrice, variant, image, msg = resolveVariant(product, item.Options)
+			if msg != "" {
+				return helper.ErrorResponse(c, fiber.StatusBadRequest, msg)
 			}
 
 			// Allow sellers to purchase from their own shop for testing purposes
@@ -95,7 +142,7 @@ func Checkout(c *fiber.Ctx) error {
 			}
 		}
 
-		itemTotal := product.Price * float64(item.Quantity)
+		itemTotal := unitPrice * float64(item.Quantity)
 		totalAmount += itemTotal
 
 		var shopOID primitive.ObjectID
@@ -109,7 +156,9 @@ func Checkout(c *fiber.Ctx) error {
 			ProductID: prodOID,
 			ShopID:    shopOID,
 			Name:      product.Name,
-			Price:     product.Price,
+			Variant:   variant,
+			Image:     image,
+			Price:     unitPrice,
 			Quantity:  item.Quantity,
 		})
 	}

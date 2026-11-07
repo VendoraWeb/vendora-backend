@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"vendora/config"
@@ -37,17 +38,60 @@ func UpdateProfile(c *fiber.Ctx) error {
 	}
 
 	collection := config.DB.Collection("users")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 
-	update := bson.M{
-		"$set": bson.M{
-			"email":   req.Email,
-			"phone":   req.Phone,
-			"address": req.Address,
-			"avatar":  req.Avatar,
-		},
+	var current model.User
+	if err := collection.FindOne(ctx, bson.M{"_id": objID}).Decode(&current); err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Akun tidak ditemukan"})
 	}
+
+	// Email & nomor HP dipakai untuk login + OTP, jadi harus valid dan unik.
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if !helper.IsEmail(req.Email) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Format email belum benar"})
+	}
+	phoneE164 := ""
+	if strings.TrimSpace(req.Phone) != "" {
+		phoneE164 = helper.NormalizePhone(req.Phone)
+		if phoneE164 == "" {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Nomor HP belum benar. Contoh: 0812 3456 7890"})
+		}
+	}
+	if !strings.EqualFold(req.Email, current.Email) {
+		other, err := findUserByIdentifier(ctx, req.Email)
+		if err == nil && other != nil && other.ID != objID {
+			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Email sudah dipakai akun lain"})
+		}
+	}
+	currentPhone := current.PhoneE164
+	if currentPhone == "" {
+		currentPhone = helper.NormalizePhone(current.Phone)
+	}
+	if phoneE164 != "" && phoneE164 != currentPhone {
+		others, _ := findUsersByIdentifier(ctx, phoneE164)
+		for _, other := range others {
+			if other.ID != objID {
+				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "Nomor HP sudah dipakai akun lain"})
+			}
+		}
+	}
+
+	set := bson.M{
+		"email":      req.Email,
+		"phone":      strings.TrimSpace(req.Phone),
+		"phone_e164": phoneE164,
+		"address":    req.Address,
+		"avatar":     req.Avatar,
+	}
+	// Ganti email/nomor → status terverifikasi kembali false sampai OTP berikutnya
+	if !strings.EqualFold(req.Email, current.Email) {
+		set["email_verified"] = false
+	}
+	if phoneE164 != currentPhone {
+		set["phone_verified"] = false
+	}
+	update := bson.M{"$set": set}
 
 	_, err = collection.UpdateOne(ctx, bson.M{"_id": objID}, update)
 	if err != nil {

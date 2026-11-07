@@ -6,6 +6,8 @@ type TransactionItem struct {
 	ProductID primitive.ObjectID `bson:"product_id" json:"product_id"`
 	ShopID    primitive.ObjectID `bson:"shop_id,omitempty" json:"shop_id,omitempty"`
 	Name      string             `bson:"name" json:"name"`
+	Variant   string             `bson:"variant,omitempty" json:"variant,omitempty"` // mis. "Burgundy, 512 GB"
+	Image     string             `bson:"image,omitempty" json:"image,omitempty"`
 	Price     float64            `bson:"price" json:"price"`
 	Quantity  int                `bson:"quantity" json:"quantity"`
 }

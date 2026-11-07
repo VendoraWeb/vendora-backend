@@ -1,15 +1,25 @@
-# Binaries
+# Binaries & build artifacts
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+server_backend
+testapi
+tmp*
 
 # Test binary
 *.test
 
 # Output of go coverage
 *.out
+output.txt
+
+# Node (in case any scripts run)
+node_modules/
+package-lock.json
 
 # Environment variables
 .env
+.env.*
+!.env.example

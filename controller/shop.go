@@ -17,7 +17,7 @@ import (
 type RentShopReq struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	OwnerID     string `json:"owner_id"` // Owner ID (role: seller)
+	OwnerID     string `json:"owner_id"`    // Owner ID (role: seller)
 	RentalDays  int    `json:"rental_days"` // Days of rental (e.g. 30 days, 365 days)
 }
 
@@ -273,5 +273,3 @@ func DeleteShop(c *fiber.Ctx) error {
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Shop deleted successfully", nil)
 }
-
-
