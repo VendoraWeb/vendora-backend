@@ -56,7 +56,7 @@ func ConnectDB() {
 		dbName = "vendora_db"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 
 	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
@@ -65,15 +65,17 @@ func ConnectDB() {
 		return
 	}
 
+	// Tetap inisialisasi instance DB agar request berikutnya tetap terlayani meskipun ping awal lambat
+	DB = client.Database(dbName)
+
 	// Ping database
 	err = client.Ping(ctx, nil)
 	if err != nil {
-		fmt.Printf("WARNING: Failed to ping MongoDB: %v\n", err)
+		fmt.Printf("WARNING: Initial MongoDB ping slow/failed (will retry on requests): %v\n", err)
 		return
 	}
 
 	fmt.Println("Successfully connected to MongoDB!")
-	DB = client.Database(dbName)
 
 	// Run Seed Data
 	seedData()

@@ -20,23 +20,31 @@ type CreateTicketReq struct {
 }
 
 func CreateTicket(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	var req CreateTicketReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
 	}
 
-	if req.SellerID == "" || req.Subject == "" || req.Message == "" {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "SellerID, Subject, and Message are required")
+	if req.Subject == "" || req.Message == "" {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Subject and Message are required")
 	}
 
-	sellerOID, err := primitive.ObjectIDFromHex(req.SellerID)
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Seller ID format")
+	if req.SellerID != "" && req.SellerID != authUser.ID.Hex() {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan membuat tiket atas nama pengguna lain")
 	}
+	sellerOID := authUser.ID
 
 	// Find seller user to get name
 	var seller model.User
-	err = config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": sellerOID}).Decode(&seller)
+	err := config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": sellerOID}).Decode(&seller)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Seller not found")
 	}
@@ -62,9 +70,22 @@ func CreateTicket(c *fiber.Ctx) error {
 }
 
 func ListTickets(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	filter := bson.M{}
 	sellerID := c.Query("seller_id")
-	if sellerID != "" {
+	if authUser.Role != "admin" {
+		if sellerID != "" && sellerID != authUser.ID.Hex() {
+			return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan membaca tiket pengguna lain")
+		}
+		filter["seller_id"] = authUser.ID
+	} else if sellerID != "" {
 		sellerOID, err := primitive.ObjectIDFromHex(sellerID)
 		if err == nil {
 			filter["seller_id"] = sellerOID

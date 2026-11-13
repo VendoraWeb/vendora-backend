@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -21,6 +23,8 @@ type ProductReq struct {
 	Category    *string              `json:"category"`
 	Subcategory *string              `json:"subcategory"`
 	Price       float64              `json:"price"`
+	PromoPrice  *float64             `json:"promo_price"` // >0 = aktifkan promo; 0 = matikan promo
+	PromoLabel  *string              `json:"promo_label"` // mis. "Flash Sale", "Diskon Spesial"
 	Stock       *int                 `json:"stock"`
 	Images      []string             `json:"images"`
 	Options     *[]model.OptionGroup `json:"options"`    // dikirim = diganti; [] = hapus semua variasi
@@ -72,6 +76,15 @@ func cleanOptions(groups []model.OptionGroup, basePrice float64) ([]model.Option
 }
 
 func AddProduct(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	var req ProductReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
@@ -83,10 +96,6 @@ func AddProduct(c *fiber.Ctx) error {
 	}
 	if req.ShopID == "" || strings.TrimSpace(req.Name) == "" || req.Price <= 0 || stock < 0 {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "ShopID, Name, positive Price and valid Stock are required")
-	}
-
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
 	}
 
 	shopOID, err := primitive.ObjectIDFromHex(req.ShopID)
@@ -101,8 +110,12 @@ func AddProduct(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Associated Shop not found")
 	}
 
-	if shop.Status != "active" {
-		return helper.ErrorResponse(c, fiber.StatusForbidden, "Cannot add product: Shop is inactive or suspended")
+	if authUser.Role != "admin" && shop.OwnerID != authUser.ID {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan menambah produk ke ruko milik penjual lain")
+	}
+
+	if EffectiveShopStatus(shop) != "active" {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak dapat menambah produk: Ruko sedang jatuh tempo atau ditangguhkan")
 	}
 
 	newProduct := model.Product{
@@ -134,10 +147,41 @@ func AddProduct(c *fiber.Ctx) error {
 	if req.SizeGuide != nil && len(req.SizeGuide.Columns) > 0 {
 		newProduct.SizeGuide = req.SizeGuide
 	}
+	if req.PromoPrice != nil && *req.PromoPrice > 0 {
+		if *req.PromoPrice >= req.Price {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Harga promo harus lebih kecil dari harga normal")
+		}
+		newProduct.PromoPrice = *req.PromoPrice
+		pct := int(math.Round(((req.Price - *req.PromoPrice) / req.Price) * 100))
+		if pct < 1 {
+			pct = 1
+		}
+		newProduct.DiscountPercent = pct
+		if req.PromoLabel != nil && strings.TrimSpace(*req.PromoLabel) != "" {
+			newProduct.PromoLabel = strings.TrimSpace(*req.PromoLabel)
+		} else {
+			newProduct.PromoLabel = fmt.Sprintf("Hemat %d%%", pct)
+		}
+	}
 
 	_, err = config.DB.Collection("products").InsertOne(context.Background(), newProduct)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to create product")
+	}
+
+	if newProduct.PromoPrice > 0 {
+		img := ""
+		if len(newProduct.Images) > 0 {
+			img = newProduct.Images[0]
+		}
+		PushBroadcastNotification(
+			"buyer",
+			"promo",
+			fmt.Sprintf("Promo Baru %s: Diskon %d%%!", shop.Name, newProduct.DiscountPercent),
+			fmt.Sprintf("%s kini turun harga dari Rp %.0f menjadi Rp %.0f. Yuk cek sebelum kehabisan!", newProduct.Name, newProduct.Price, newProduct.PromoPrice),
+			"index.html#catalog-anchor",
+			img,
+		)
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusCreated, "Product added successfully", newProduct)
@@ -156,14 +200,17 @@ func ListProducts(c *fiber.Ctx) error {
 			filter["shop_id"] = shopOID
 		}
 	} else {
-		// Filter out products from suspended shops in the buyer catalog
+		// Sembunyikan produk yang di-hide moderator dan produk dari ruko yang ditangguhkan atau jatuh tempo dari katalog publik pembeli (EffectiveShopStatus(shop) == "active")
+		filter["hidden"] = bson.M{"$ne": true}
 		activeCursor, err := config.DB.Collection("shops").Find(context.Background(), bson.M{"status": "active"})
 		if err == nil {
 			var activeShops []model.Shop
 			if err = activeCursor.All(context.Background(), &activeShops); err == nil {
 				var activeShopOIDs []primitive.ObjectID
 				for _, shop := range activeShops {
-					activeShopOIDs = append(activeShopOIDs, shop.ID)
+					if EffectiveShopStatus(shop) == "active" {
+						activeShopOIDs = append(activeShopOIDs, shop.ID)
+					}
 				}
 				if len(activeShopOIDs) == 0 {
 					return helper.SuccessResponse(c, fiber.StatusOK, "Products list retrieved successfully", []model.Product{})
@@ -212,6 +259,15 @@ func GetProduct(c *fiber.Ctx) error {
 }
 
 func UpdateProduct(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	productID := c.Params("id")
 	if productID == "" {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Product ID param is required")
@@ -222,13 +278,23 @@ func UpdateProduct(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
 	}
 
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
-	}
-
 	oid, err := primitive.ObjectIDFromHex(productID)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Product ID format")
+	}
+
+	var currentProd model.Product
+	if err := config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&currentProd); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found")
+	}
+	hasCurrent := true
+
+	var shop model.Shop
+	if err := config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": currentProd.ShopID}).Decode(&shop); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Associated Shop not found")
+	}
+	if authUser.Role != "admin" && shop.OwnerID != authUser.ID {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan mengubah produk milik ruko lain")
 	}
 
 	updateFields := bson.M{}
@@ -255,13 +321,11 @@ func UpdateProduct(c *fiber.Ctx) error {
 	if req.Subcategory != nil {
 		updateFields["subcategory"] = strings.TrimSpace(*req.Subcategory)
 	}
+
 	if req.Options != nil {
 		price := req.Price
-		if price <= 0 {
-			var current model.Product
-			if err := config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&current); err == nil {
-				price = current.Price
-			}
+		if price <= 0 && hasCurrent {
+			price = currentProd.Price
 		}
 		opts, msg := cleanOptions(*req.Options, price)
 		if msg != "" {
@@ -271,6 +335,49 @@ func UpdateProduct(c *fiber.Ctx) error {
 			unsetFields["options"] = ""
 		} else {
 			updateFields["options"] = opts
+		}
+	}
+
+	// Dukungan edit harga promo / diskon produk oleh penjual
+	var notifyPromo bool
+	var promoDiscount int
+	var promoPriceVal float64
+	var basePriceVal float64
+	if req.PromoPrice != nil {
+		basePriceVal = req.Price
+		if basePriceVal <= 0 && hasCurrent {
+			basePriceVal = currentProd.Price
+		}
+		if *req.PromoPrice <= 0 {
+			unsetFields["promo_price"] = ""
+			unsetFields["discount_percent"] = ""
+			unsetFields["promo_label"] = ""
+		} else {
+			if basePriceVal > 0 && *req.PromoPrice >= basePriceVal {
+				return helper.ErrorResponse(c, fiber.StatusBadRequest, "Harga promo harus lebih kecil dari harga normal")
+			}
+			promoPriceVal = *req.PromoPrice
+			promoDiscount = int(math.Round(((basePriceVal - promoPriceVal) / basePriceVal) * 100))
+			if promoDiscount < 1 {
+				promoDiscount = 1
+			}
+			updateFields["promo_price"] = promoPriceVal
+			updateFields["discount_percent"] = promoDiscount
+			if req.PromoLabel != nil && strings.TrimSpace(*req.PromoLabel) != "" {
+				updateFields["promo_label"] = strings.TrimSpace(*req.PromoLabel)
+			} else {
+				updateFields["promo_label"] = fmt.Sprintf("Hemat %d%%", promoDiscount)
+			}
+			if !hasCurrent || currentProd.PromoPrice != promoPriceVal {
+				notifyPromo = true
+			}
+		}
+	} else if req.PromoLabel != nil {
+		lbl := strings.TrimSpace(*req.PromoLabel)
+		if lbl == "" {
+			unsetFields["promo_label"] = ""
+		} else {
+			updateFields["promo_label"] = lbl
 		}
 	}
 	if req.Specs != nil {
@@ -312,10 +419,36 @@ func UpdateProduct(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found")
 	}
 
+	if notifyPromo {
+		prodName := currentProd.Name
+		if n, ok := updateFields["name"].(string); ok && n != "" {
+			prodName = n
+		}
+		img := ""
+		if len(req.Images) > 0 {
+			img = req.Images[0]
+		} else if len(currentProd.Images) > 0 {
+			img = currentProd.Images[0]
+		}
+		PushBroadcastNotification(
+			"buyer",
+			"promo",
+			fmt.Sprintf("Flash Promo: Diskon %d%% untuk %s!", promoDiscount, prodName),
+			fmt.Sprintf("Harga turun dari Rp %.0f menjadi Rp %.0f. Buruan serbu sekarang!", basePriceVal, promoPriceVal),
+			"index.html#catalog-anchor",
+			img,
+		)
+	}
+
 	return helper.SuccessResponse(c, fiber.StatusOK, "Product updated successfully", nil)
 }
 
 func DeleteProduct(c *fiber.Ctx) error {
+	user, aerr := requireAuth(c)
+	if user == nil {
+		return aerr
+	}
+
 	productID := c.Params("id")
 	if productID == "" {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Product ID param is required")
@@ -328,6 +461,22 @@ func DeleteProduct(c *fiber.Ctx) error {
 	oid, err := primitive.ObjectIDFromHex(productID)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Product ID format")
+	}
+
+	var prod model.Product
+	if err := config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&prod); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found")
+	}
+
+	// Hanya Admin atau Penjual pemilik ruko tempat produk tersebut berada yang boleh menghapus produk.
+	if user.Role != "admin" {
+		if user.Role != "seller" {
+			return helper.ErrorResponse(c, fiber.StatusForbidden, "Akses ditolak: Anda tidak memiliki izin menghapus produk")
+		}
+		var shop model.Shop
+		if err := config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": prod.ShopID, "owner_id": user.ID}).Decode(&shop); err != nil {
+			return helper.ErrorResponse(c, fiber.StatusForbidden, "Akses ditolak: Anda hanya dapat menghapus produk milik toko Anda sendiri")
+		}
 	}
 
 	result, err := config.DB.Collection("products").DeleteOne(context.Background(), bson.M{"_id": oid})

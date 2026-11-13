@@ -6,10 +6,10 @@ import (
 	"os"
 
 	"vendora/config"
+	"vendora/controller"
 	"vendora/url"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/gofiber/fiber/v2/middleware/cors"
 )
 
 func main() {
@@ -20,15 +20,11 @@ func main() {
 		AppName: "Vendora E-Commerce Engine v1.0",
 	})
 
-	// Add CORS middleware
-	app.Use(cors.New(cors.Config{
-		AllowOrigins: "*", // Or specifically "http://127.0.0.1:3000, http://localhost:3000"
-		AllowHeaders: "Origin, Content-Type, Accept",
-		AllowMethods: "GET, POST, HEAD, PUT, DELETE, PATCH",
-	}))
-
-	// Setup routes
+	// Setup routes (termasuk konfigurasi CORS terpusat)
 	url.SetupRoutes(app)
+
+	// Penyelesaian otomatis pesanan yang melewati batas konfirmasi (dana Escrow cair)
+	controller.StartAutoCompleteWorker()
 
 	// Ping route for checking health
 	app.Get("/", func(c *fiber.Ctx) error {

@@ -23,3 +23,9 @@ package-lock.json
 .env
 .env.*
 !.env.example
+
+# Database backups & local dumps
+backup/
+backups/
+*.bson
+*.gz

@@ -212,13 +212,13 @@ func Login(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Akun ini diblokir. Hubungi admin Vendora.")
 	}
 	// Kata sandi benar → langsung masuk. OTP dipakai untuk lupa/ganti kata sandi.
-	sessionToken, err := helper.RandomToken(24)
+	sessionToken, err := IssueSession(user.ID)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal membuat sesi")
 	}
 	return helper.SuccessResponse(c, fiber.StatusOK, "Berhasil masuk", fiber.Map{
 		"otp_required": false,
-		"token":        "vdr_" + sessionToken,
+		"token":        sessionToken,
 		"user":         user,
 	})
 }
@@ -411,14 +411,14 @@ func VerifyOTP(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Akun ini diblokir. Hubungi admin Vendora.")
 	}
 	_, _ = otpCol().UpdateOne(ctx, bson.M{"_id": ch.ID}, bson.M{"$set": bson.M{"verified": true, "used": true}})
-	sessionToken, _ := helper.RandomToken(24)
+	sessionToken, _ := IssueSession(user.ID)
 	if !ch.DevMode && ch.Channel == "email" {
 		user.EmailVerified = true
 	} else if !ch.DevMode && ch.Channel == "phone" {
 		user.PhoneVerified = true
 	}
 	return helper.SuccessResponse(c, fiber.StatusOK, "Berhasil masuk", fiber.Map{
-		"token": "vdr_" + sessionToken,
+		"token": sessionToken,
 		"user":  user,
 	})
 }

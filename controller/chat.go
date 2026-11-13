@@ -82,46 +82,61 @@ func decodeDataURL(s string) (mime string, data []byte, errMsg string) {
 }
 
 func SendMessage(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	var req SendMsgReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
 	}
 
 	req.Text = strings.TrimSpace(req.Text)
-	if req.SenderID == "" || req.ShopID == "" || (req.Text == "" && req.Image == "") {
+	if req.ShopID == "" || (req.Text == "" && req.Image == "") {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Pesan atau foto wajib diisi")
 	}
 	if utf8.RuneCountInString(req.Text) > maxChatText {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Pesan terlalu panjang (maksimal 2000 karakter)")
 	}
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	if strings.TrimSpace(req.SenderID) != "" && strings.TrimSpace(req.SenderID) != authUser.ID.Hex() {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan mengirim pesan atas nama pengguna lain")
 	}
 
-	senderOID, err1 := primitive.ObjectIDFromHex(req.SenderID)
-	shopOID, err2 := primitive.ObjectIDFromHex(req.ShopID)
-	if err1 != nil || err2 != nil {
+	senderOID := authUser.ID
+	shopOID, err := primitive.ObjectIDFromHex(req.ShopID)
+	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID format")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	var shop model.Shop
+	if err := config.DB.Collection("shops").FindOne(ctx, bson.M{"_id": shopOID}).Decode(&shop); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+
 	var receiverOID primitive.ObjectID
-	if req.ReceiverID == "" {
-		// Pembeli mengirim ke pemilik toko
-		var shop model.Shop
-		if err := config.DB.Collection("shops").FindOne(ctx, bson.M{"_id": shopOID}).Decode(&shop); err != nil {
-			return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
-		}
-		receiverOID = shop.OwnerID
-	} else {
-		recOID, err := primitive.ObjectIDFromHex(req.ReceiverID)
-		if err != nil {
+	isBuyerMessage := false
+	if senderOID == shop.OwnerID {
+		// Pemilik toko membalas ke pembeli
+		recOID, err := primitive.ObjectIDFromHex(strings.TrimSpace(req.ReceiverID))
+		if err != nil || recOID.IsZero() {
 			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Receiver ID format")
 		}
 		receiverOID = recOID
+	} else {
+		// Pembeli mengirim ke pemilik toko
+		receiverOID = shop.OwnerID
+		isBuyerMessage = true
 	}
+
+	prevCount, _ := config.DB.Collection("messages").CountDocuments(ctx, conversationFilter(shopOID, senderOID, shop.OwnerID))
 
 	now := primitive.NewDateTimeFromTime(time.Now())
 	msg := model.Message{
@@ -154,6 +169,19 @@ func SendMessage(c *fiber.Ctx) error {
 
 	if _, err := config.DB.Collection("messages").InsertOne(ctx, msg); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to send message")
+	}
+
+	// Sambutan otomatis dari sistem atas nama ruko untuk pesan pertama pembeli (tanpa spoofing dari sisi klien)
+	if isBuyerMessage && prevCount == 0 && !shop.OwnerID.IsZero() {
+		greeting := model.Message{
+			ID:         primitive.NewObjectID(),
+			SenderID:   shop.OwnerID,
+			ReceiverID: senderOID,
+			ShopID:     shopOID,
+			Text:       "Terima kasih sudah menghubungi kami! Pesanmu sudah diterima dan akan segera dibalas oleh penjual.",
+			CreatedAt:  primitive.NewDateTimeFromTime(time.Now().Add(time.Millisecond * 10)),
+		}
+		_, _ = config.DB.Collection("messages").InsertOne(ctx, greeting)
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusCreated, "Message sent", msg)
@@ -201,6 +229,14 @@ func shopOwner(ctx context.Context, shopOID primitive.ObjectID) (primitive.Objec
 }
 
 func GetChatHistory(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	buyerID := c.Query("buyer_id")
 	shopID := c.Query("shop_id")
 	if buyerID == "" || shopID == "" {
@@ -212,9 +248,6 @@ func GetChatHistory(c *fiber.Ctx) error {
 	if err1 != nil || err2 != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID format")
 	}
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -222,6 +255,10 @@ func GetChatHistory(c *fiber.Ctx) error {
 	ownerOID, err := shopOwner(ctx, shopOID)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+
+	if authUser.Role != "admin" && authUser.ID != buyerOID && authUser.ID != ownerOID {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Bukan peserta percakapan ini")
 	}
 
 	opts := options.Find().SetSort(bson.D{{Key: "created_at", Value: 1}, {Key: "_id", Value: 1}}).SetLimit(500)
@@ -247,18 +284,26 @@ type MarkReadReq struct {
 
 // MarkChatRead menandai pesan untuk pembaca sebagai sudah dibaca (centang dua).
 func MarkChatRead(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	var req MarkReadReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
 	}
-	readerOID, err1 := primitive.ObjectIDFromHex(req.ReaderID)
+	if strings.TrimSpace(req.ReaderID) != "" && strings.TrimSpace(req.ReaderID) != authUser.ID.Hex() {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan menandai pesan atas nama pengguna lain")
+	}
+	readerOID := authUser.ID
 	buyerOID, err2 := primitive.ObjectIDFromHex(req.BuyerID)
 	shopOID, err3 := primitive.ObjectIDFromHex(req.ShopID)
-	if err1 != nil || err2 != nil || err3 != nil {
+	if err2 != nil || err3 != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid ID format")
-	}
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -314,12 +359,25 @@ type BuyerInboxItem struct {
 
 // GetBuyerInbox: daftar toko yang pernah dichat seorang pembeli (seperti daftar chat WhatsApp).
 func GetBuyerInbox(c *fiber.Ctx) error {
-	buyerOID, err := primitive.ObjectIDFromHex(c.Query("buyer_id"))
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "buyer_id tidak valid")
-	}
 	if config.DB == nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
+	buyerQuery := strings.TrimSpace(c.Query("buyer_id"))
+	buyerOID := authUser.ID
+	if buyerQuery != "" {
+		parsedOID, err := primitive.ObjectIDFromHex(buyerQuery)
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "buyer_id tidak valid")
+		}
+		if authUser.Role != "admin" && parsedOID != authUser.ID {
+			return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan membaca inbox pengguna lain")
+		}
+		buyerOID = parsedOID
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -375,6 +433,13 @@ func GetBuyerInbox(c *fiber.Ctx) error {
 }
 
 func GetSellerInbox(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
 	if c.Query("buyer_id") != "" && c.Query("shop_id") == "" {
 		return GetBuyerInbox(c)
 	}
@@ -386,9 +451,6 @@ func GetSellerInbox(c *fiber.Ctx) error {
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid shop_id")
 	}
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
-	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -396,6 +458,9 @@ func GetSellerInbox(c *fiber.Ctx) error {
 	ownerOID, err := shopOwner(ctx, shopOID)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+	if authUser.Role != "admin" && authUser.ID != ownerOID {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Hanya pemilik ruko yang dapat mengakses inbox ruko ini")
 	}
 
 	opts := options.Find().SetSort(bson.M{"created_at": -1}).SetLimit(2000)
@@ -455,12 +520,23 @@ func GetSellerInbox(c *fiber.Ctx) error {
 
 // GetChatUnread: jumlah pesan belum dibaca untuk seorang pengguna (badge ikon chat).
 func GetChatUnread(c *fiber.Ctx) error {
-	userOID, err := primitive.ObjectIDFromHex(c.Query("user_id"))
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "user_id tidak valid")
-	}
 	if config.DB == nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+	userOID := authUser.ID
+	if q := strings.TrimSpace(c.Query("user_id")); q != "" {
+		parsedOID, err := primitive.ObjectIDFromHex(q)
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "user_id tidak valid")
+		}
+		if authUser.Role != "admin" && parsedOID != authUser.ID {
+			return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan melihat pesan pengguna lain")
+		}
+		userOID = parsedOID
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

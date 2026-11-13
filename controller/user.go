@@ -23,6 +23,15 @@ type UpdateProfileReq struct {
 }
 
 func UpdateProfile(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	var req UpdateProfileReq
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -30,12 +39,13 @@ func UpdateProfile(c *fiber.Ctx) error {
 		})
 	}
 
-	objID, err := primitive.ObjectIDFromHex(req.UserID)
-	if err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid user ID",
+	if strings.TrimSpace(req.UserID) != "" && strings.TrimSpace(req.UserID) != authUser.ID.Hex() {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Tidak diizinkan mengubah profil akun pengguna lain",
 		})
 	}
+
+	objID := authUser.ID
 
 	collection := config.DB.Collection("users")
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -93,7 +103,7 @@ func UpdateProfile(c *fiber.Ctx) error {
 	}
 	update := bson.M{"$set": set}
 
-	_, err = collection.UpdateOne(ctx, bson.M{"_id": objID}, update)
+	_, err := collection.UpdateOne(ctx, bson.M{"_id": objID}, update)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
 			"error": "Failed to update profile",
@@ -135,6 +145,15 @@ func ListUsers(c *fiber.Ctx) error {
 	var users []model.User
 	if err = cursor.All(ctx, &users); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding users list")
+	}
+
+	// Privasi Data (Admin tidak boleh melihat email, nomor HP, atau alamat asli pengguna)
+	for i := range users {
+		if users[i].Role != "admin" {
+			users[i].Email = helper.MaskEmail(users[i].Email)
+			users[i].Phone = helper.MaskPhone(helper.NormalizePhone(users[i].Phone))
+			users[i].Address = helper.MaskAddress(users[i].Address)
+		}
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Users retrieved successfully", users)

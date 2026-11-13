@@ -22,27 +22,40 @@ type RentShopReq struct {
 }
 
 func RentShop(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	}
+
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	var req RentShopReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
 	}
 
-	if req.Name == "" || req.OwnerID == "" || req.RentalDays <= 0 {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Name, owner_id, and positive rental_days are required")
+	if req.Name == "" || req.RentalDays <= 0 {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Name and positive rental_days are required")
 	}
 
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+	if req.OwnerID != "" && authUser.Role != "admin" && req.OwnerID != authUser.ID.Hex() {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan menyewa ruko atas nama pengguna lain")
 	}
 
-	ownerOID, err := primitive.ObjectIDFromHex(req.OwnerID)
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Owner ID format")
+	ownerOID := authUser.ID
+	if authUser.Role == "admin" && req.OwnerID != "" {
+		parsedOID, err := primitive.ObjectIDFromHex(req.OwnerID)
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Owner ID format")
+		}
+		ownerOID = parsedOID
 	}
 
 	// Verify owner is a Seller
 	var owner model.User
-	err = config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": ownerOID}).Decode(&owner)
+	err := config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": ownerOID}).Decode(&owner)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Owner user not found")
 	}
@@ -84,6 +97,24 @@ func RentShop(c *fiber.Ctx) error {
 	return helper.SuccessResponse(c, fiber.StatusCreated, "Shop rented successfully! Space allocated.", newShop)
 }
 
+// EffectiveShopStatus menghitung status efektif toko saat dibaca tanpa mengubah field status di database:
+// - "suspended" : ditangguhkan admin
+// - "expired"   : masa sewa sudah lewat (jatuh tempo)
+// - "active"    : aktif dan masa sewa masih berlaku
+func EffectiveShopStatus(s model.Shop) string {
+	if s.Status == "suspended" {
+		return "suspended"
+	}
+	exp := s.RentalExpires.Time()
+	if !exp.IsZero() && exp.Before(time.Now()) {
+		return "expired"
+	}
+	if s.Status == "active" {
+		return "active"
+	}
+	return s.Status
+}
+
 func ListShops(c *fiber.Ctx) error {
 	if config.DB == nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
@@ -113,17 +144,18 @@ func ListShops(c *fiber.Ctx) error {
 			avatar = owner.Avatar
 		}
 		responseShops = append(responseShops, fiber.Map{
-			"id":             s.ID,
-			"name":           s.Name,
-			"description":    s.Description,
-			"owner_id":       s.OwnerID,
-			"status":         s.Status,
-			"rental_price":   s.RentalPrice,
-			"rental_expires": s.RentalExpires,
-			"created_at":     s.CreatedAt,
-			"owner_phone":    phone,
-			"owner_address":  address,
-			"owner_avatar":   avatar,
+			"id":               s.ID,
+			"name":             s.Name,
+			"description":      s.Description,
+			"owner_id":         s.OwnerID,
+			"status":           s.Status,
+			"effective_status": EffectiveShopStatus(s),
+			"rental_price":     s.RentalPrice,
+			"rental_expires":   s.RentalExpires,
+			"created_at":       s.CreatedAt,
+			"owner_phone":      phone,
+			"owner_address":    address,
+			"owner_avatar":     avatar,
 		})
 	}
 
@@ -194,6 +226,11 @@ func RenewShop(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
 	}
 
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+
 	oid, err := primitive.ObjectIDFromHex(shopID)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Shop ID format")
@@ -204,6 +241,10 @@ func RenewShop(c *fiber.Ctx) error {
 	err = config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&shop)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+
+	if authUser.Role != "admin" && shop.OwnerID != authUser.ID {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Hanya pemilik ruko atau admin yang dapat memperpanjang sewa ruko")
 	}
 
 	// Extend from current expiry (or now if already expired)
@@ -253,6 +294,18 @@ func DeleteShop(c *fiber.Ctx) error {
 	err = config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&shop)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
+	}
+
+	// Tolak penghapusan ruko bila masih memiliki pesanan aktif (pending, pending_payment, paid, shipped, disputed)
+	activeTxCount, _ := config.DB.Collection("transactions").CountDocuments(
+		context.Background(),
+		bson.M{
+			"items.shop_id": oid,
+			"status":        bson.M{"$nin": []string{"success", "cancelled"}},
+		},
+	)
+	if activeTxCount > 0 {
+		return helper.ErrorResponse(c, fiber.StatusConflict, "Ruko tidak dapat dihapus karena masih memiliki pesanan aktif yang belum selesai atau dibatalkan.")
 	}
 
 	result, err := config.DB.Collection("shops").DeleteOne(context.Background(), bson.M{"_id": oid})
