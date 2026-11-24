@@ -10,6 +10,7 @@ import (
 	"vendora/url"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 )
 
 func main() {
@@ -17,8 +18,10 @@ func main() {
 	config.ConnectDB()
 
 	app := fiber.New(fiber.Config{
-		AppName: "Vendora E-Commerce Engine v1.0",
+		AppName:   "Vendora E-Commerce Engine v1.0",
+		BodyLimit: 10 * 1024 * 1024, // 10 MB agar foto chat 3 MB (base64 ~4.2 MB) tidak ditolak 413
 	})
+	app.Use(recover.New())
 
 	// Setup routes (termasuk konfigurasi CORS terpusat)
 	url.SetupRoutes(app)

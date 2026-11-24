@@ -19,6 +19,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
@@ -93,6 +94,9 @@ func resolveVariant(p model.Product, chosen map[string]string) (price float64, l
 		if !found {
 			return 0, "", "", g.Name + " \"" + want + "\" tidak tersedia untuk " + p.Name
 		}
+	}
+	if price <= 0 {
+		return 0, "", "", "Harga variasi produk " + p.Name + " tidak valid"
 	}
 	return price, strings.Join(labels, ", "), image, ""
 }
@@ -170,6 +174,14 @@ func Checkout(c *fiber.Ctx) error {
 	if len(req.Items) == 0 {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Minimal satu barang diperlukan untuk checkout")
 	}
+	if authUser.Role != "buyer" && authUser.Role != "seller" {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Akun ini tidak bisa berbelanja")
+	}
+	req.RecipientName = strings.TrimSpace(req.RecipientName)
+	req.ShippingAddress = strings.TrimSpace(req.ShippingAddress)
+	if req.RecipientName == "" || len([]rune(req.ShippingAddress)) < 10 {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Lengkapi nama penerima dan alamat pengiriman")
+	}
 
 	if strings.TrimSpace(req.BuyerID) != "" && strings.TrimSpace(req.BuyerID) != authUser.ID.Hex() {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan melakukan checkout atas nama pengguna lain")
@@ -200,20 +212,18 @@ func Checkout(c *fiber.Ctx) error {
 	}
 
 	var transactionItems []model.TransactionItem
-	var subtotalAmount float64
-	shopSubtotals := map[primitive.ObjectID]float64{}
 
 	// Process each item (hanya produk valid dari database, cabang mockup dihapus)
 	for _, item := range req.Items {
-		if item.Quantity < 1 {
+		if item.Quantity < 1 || item.Quantity > 99 {
 			rollbackDeducted()
-			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Jumlah barang minimal 1")
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Jumlah tiap barang 1–99")
 		}
 
 		prodOID, err := primitive.ObjectIDFromHex(strings.TrimSpace(item.ProductID))
 		if err != nil || prodOID.IsZero() {
 			rollbackDeducted()
-			return helper.ErrorResponse(c, fiber.StatusBadRequest, "ID produk tidak valid: "+item.ProductID)
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Ada barang contoh lama di keranjang yang sudah tidak dijual. Hapus dulu dari keranjang.")
 		}
 
 		var product model.Product
@@ -253,6 +263,10 @@ func Checkout(c *fiber.Ctx) error {
 			rollbackDeducted()
 			return helper.ErrorResponse(c, fiber.StatusForbidden, fmt.Sprintf("Checkout ditolak: Masa sewa ruko \"%s\" telah berakhir (jatuh tempo). Toko belum dapat menerima pesanan baru.", itemShop.Name))
 		}
+		if effStatus != "active" {
+			rollbackDeducted()
+			return helper.ErrorResponse(c, fiber.StatusForbidden, fmt.Sprintf("Checkout ditolak: Toko \"%s\" belum aktif berjualan.", itemShop.Name))
+		}
 
 		unitPrice, variant, image, msg := resolveVariant(product, item.Options)
 		if msg != "" {
@@ -280,10 +294,6 @@ func Checkout(c *fiber.Ctx) error {
 		}
 		deducted = append(deducted, deductedStock{prodOID: prodOID, qty: item.Quantity})
 
-		itemTotal := unitPrice * float64(item.Quantity)
-		subtotalAmount += itemTotal
-		shopSubtotals[shopOID] += itemTotal
-
 		transactionItems = append(transactionItems, model.TransactionItem{
 			ProductID:     prodOID,
 			ShopID:        shopOID,
@@ -296,98 +306,132 @@ func Checkout(c *fiber.Ctx) error {
 		})
 	}
 
-	// Hitung Kurir, Pajak Platform (2.5%), dan Escrow
-	courier := findCourier(req.CourierCode)
-	shippingCost := courier.Cost
-	platformFee := math.Round(subtotalAmount * PlatformFeeRate)
-	sellerNetAmount := subtotalAmount - platformFee
-	totalAmount := subtotalAmount + shippingCost
+	// Satu pesanan per ruko (seperti marketplace pada umumnya): tiap penjual memproses,
+	// mengirim, dan menerima dana pesanannya sendiri. Ongkir dihitung per ruko.
+	shopOrder := []primitive.ObjectID{}
+	shopItems := map[primitive.ObjectID][]model.TransactionItem{}
+	for _, it := range transactionItems {
+		if _, ok := shopItems[it.ShopID]; !ok {
+			shopOrder = append(shopOrder, it.ShopID)
+		}
+		shopItems[it.ShopID] = append(shopItems[it.ShopID], it)
+	}
 
+	courier := findCourier(req.CourierCode)
 	if req.PaymentMethod == "" {
 		req.PaymentMethod = "QRIS"
 	}
-
-	txID := primitive.NewObjectID()
 	now := time.Now()
 	nowDT := primitive.NewDateTimeFromTime(now)
 	expDT := primitive.NewDateTimeFromTime(now.Add(15 * time.Minute))
-	payToken, payCode := generatePaymentSecurity(txID, buyerOID, totalAmount, req.PaymentMethod)
-
+	dest := inferDestinationCoords(req.ShippingAddress)
 	origin := model.GeoLocation{
 		Label: "Gudang Ruko Penjual (Jakarta Pusat)",
 		City:  "Jakarta Pusat",
 		Lat:   -6.1944,
 		Lng:   106.8229,
 	}
-	dest := inferDestinationCoords(req.ShippingAddress)
-	trackingNo := fmt.Sprintf("%s-%s", courier.Code, strings.ToUpper(txID.Hex()[len(txID.Hex())-8:]))
 
-	initialStatus := "pending"
-	escrowStatus := "held"
-	var paidAtPtr *primitive.DateTime = &nowDT
-	confirmByDT := primitive.NewDateTimeFromTime(now.Add(PendingConfirmDuration()))
-	var confirmByPtr *primitive.DateTime = &confirmByDT
-	if req.WaitPayment {
-		initialStatus = "pending_payment"
-		escrowStatus = "unpaid"
-		paidAtPtr = nil
-		confirmByPtr = nil
+	created := []model.Transaction{}
+	var grandTotal, shippingTotal float64
+	for _, shopOID := range shopOrder {
+		items := shopItems[shopOID]
+		var subtotal float64
+		for _, it := range items {
+			subtotal += it.Price * float64(it.Quantity)
+		}
+		shippingCost := courier.Cost
+		platformFee := math.Round(subtotal * PlatformFeeRate)
+		totalAmount := subtotal + shippingCost
+
+		txID := primitive.NewObjectID()
+		payToken, payCode := generatePaymentSecurity(txID, buyerOID, totalAmount, req.PaymentMethod)
+		trackingNo := fmt.Sprintf("%s-%s", courier.Code, strings.ToUpper(txID.Hex()[len(txID.Hex())-8:]))
+
+		initialStatus := "pending"
+		escrowStatus := "held"
+		var paidAtPtr *primitive.DateTime = &nowDT
+		confirmByDT := primitive.NewDateTimeFromTime(now.Add(PendingConfirmDuration()))
+		var confirmByPtr *primitive.DateTime = &confirmByDT
+		if req.WaitPayment {
+			initialStatus = "pending_payment"
+			escrowStatus = "unpaid"
+			paidAtPtr = nil
+			confirmByPtr = nil
+		}
+		orig := origin
+		destCopy := dest
+
+		newTx := model.Transaction{
+			ID:               txID,
+			BuyerID:          buyerOID,
+			RecipientName:    req.RecipientName,
+			ShippingAddress:  req.ShippingAddress,
+			Items:            items,
+			ShopID:           shopOID,
+			SubtotalAmount:   subtotal,
+			ShippingCost:     shippingCost,
+			PlatformFee:      platformFee,
+			SellerNetAmount:  subtotal - platformFee,
+			TotalAmount:      totalAmount,
+			EscrowStatus:     escrowStatus,
+			PaymentMethod:    req.PaymentMethod,
+			PaymentCode:      payCode,
+			PaymentToken:     payToken,
+			PaymentExpiresAt: &expDT,
+			PaidAt:           paidAtPtr,
+			CourierCode:      courier.Code,
+			CourierService:   courier.Service,
+			CourierETD:       courier.ETD,
+			TrackingNumber:   trackingNo,
+			RouteOrigin:      &orig,
+			RouteDestination: &destCopy,
+			CurrentLocation:  &orig,
+			TrackingHistory: []model.TrackingEvent{{
+				Status:      "manifested",
+				Title:       "Pesanan Dibuat & Terverifikasi Sistem Keamanan Vendora",
+				Description: fmt.Sprintf("Menunggu penyerahan paket ke kurir %s (%s). Resi: %s", courier.Name, courier.Service, trackingNo),
+				City:        orig.City,
+				Lat:         orig.Lat,
+				Lng:         orig.Lng,
+				Timestamp:   nowDT,
+			}},
+			Status:    initialStatus,
+			ConfirmBy: confirmByPtr,
+			CreatedAt: nowDT,
+		}
+
+		if _, err := config.DB.Collection("transactions").InsertOne(context.Background(), newTx); err != nil {
+			rollbackDeducted()
+			for _, done := range created {
+				_, _ = config.DB.Collection("transactions").DeleteOne(context.Background(), bson.M{"_id": done.ID})
+			}
+			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal menyimpan pesanan")
+		}
+		created = append(created, newTx)
+		grandTotal += totalAmount
+		shippingTotal += shippingCost
 	}
 
-	trackingEvents := []model.TrackingEvent{
-		{
-			Status:      "manifested",
-			Title:       "Pesanan Dibuat & Terverifikasi Sistem Keamanan Vendora",
-			Description: fmt.Sprintf("Menunggu penyerahan paket ke kurir %s (%s). Resi: %s", courier.Name, courier.Service, trackingNo),
-			City:        origin.City,
-			Lat:         origin.Lat,
-			Lng:         origin.Lng,
-			Timestamp:   nowDT,
-		},
+	// Langsung dibayar → dana ditahan di Escrow per ruko & dicatat di WalletLedger
+	trackingNos := []string{}
+	for i := range created {
+		if created[i].EscrowStatus == "held" {
+			holdEscrowFunds(created[i], map[primitive.ObjectID]float64{created[i].ShopID: created[i].SubtotalAmount})
+		}
+		trackingNos = append(trackingNos, created[i].TrackingNumber)
+		if !req.WaitPayment {
+			created[i].PaymentToken = ""
+		}
 	}
 
-	newTx := model.Transaction{
-		ID:               txID,
-		BuyerID:          buyerOID,
-		RecipientName:    req.RecipientName,
-		ShippingAddress:  req.ShippingAddress,
-		Items:            transactionItems,
-		SubtotalAmount:   subtotalAmount,
-		ShippingCost:     shippingCost,
-		PlatformFee:      platformFee,
-		SellerNetAmount:  sellerNetAmount,
-		TotalAmount:      totalAmount,
-		EscrowStatus:     escrowStatus,
-		PaymentMethod:    req.PaymentMethod,
-		PaymentCode:      payCode,
-		PaymentToken:     payToken,
-		PaymentExpiresAt: &expDT,
-		PaidAt:           paidAtPtr,
-		CourierCode:      courier.Code,
-		CourierService:   courier.Service,
-		CourierETD:       courier.ETD,
-		TrackingNumber:   trackingNo,
-		RouteOrigin:      &origin,
-		RouteDestination: &dest,
-		CurrentLocation:  &origin,
-		TrackingHistory:  trackingEvents,
-		Status:           initialStatus,
-		ConfirmBy:        confirmByPtr,
-		CreatedAt:        nowDT,
-	}
-
-	_, err = config.DB.Collection("transactions").InsertOne(context.Background(), newTx)
-	if err != nil {
-		rollbackDeducted()
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to create transaction record")
-	}
-
-	// Jika langsung dibayar (Escrow Held), tambahkan ke EscrowBalance masing-masing toko & catat di WalletLedger
-	if escrowStatus == "held" {
-		holdEscrowFunds(newTx, shopSubtotals)
-	}
-
-	return helper.SuccessResponse(c, fiber.StatusCreated, "Checkout completed! Dana diamankan di Rekening Bersama (Escrow) Vendora.", newTx)
+	return helper.SuccessResponse(c, fiber.StatusCreated, "Checkout completed! Dana diamankan di Rekening Bersama (Escrow) Vendora.", fiber.Map{
+		"transactions":    created,
+		"count":           len(created),
+		"total_amount":    grandTotal,
+		"shipping_cost":   shippingTotal,
+		"tracking_number": strings.Join(trackingNos, ", "),
+	})
 }
 
 // holdEscrowFunds menahan uang pembayaran pembeli di Escrow Admin (belum bisa ditarik penjual sampai barang diterima).
@@ -595,7 +639,11 @@ func PayTransaction(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Transaksi sudah dibatalkan atau melewati batas waktu pembayaran")
 	}
 	if tx.EscrowStatus == "held" || tx.EscrowStatus == "released" {
+		tx.PaymentToken = ""
 		return helper.SuccessResponse(c, fiber.StatusOK, "Transaksi sudah terbayar dan diamankan di Escrow", tx)
+	}
+	if tx.PaymentExpiresAt != nil && time.Now().After(tx.PaymentExpiresAt.Time()) {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Batas waktu pembayaran sudah habis")
 	}
 
 	if tx.PaymentToken != "" && strings.TrimSpace(req.PaymentToken) != tx.PaymentToken {
@@ -610,9 +658,9 @@ func PayTransaction(c *fiber.Ctx) error {
 		method = req.PaymentMethod
 	}
 
-	_, err = config.DB.Collection("transactions").UpdateOne(
+	res, err := config.DB.Collection("transactions").UpdateOne(
 		ctx,
-		bson.M{"_id": oid},
+		bson.M{"_id": oid, "escrow_status": "unpaid", "status": bson.M{"$ne": "cancelled"}},
 		bson.M{
 			"$set": bson.M{
 				"status":         "pending",
@@ -626,6 +674,10 @@ func PayTransaction(c *fiber.Ctx) error {
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal memverifikasi pembayaran")
 	}
+	if res.ModifiedCount == 0 {
+		tx.PaymentToken = ""
+		return helper.SuccessResponse(c, fiber.StatusOK, "Transaksi sudah terbayar dan diamankan di Escrow", tx)
+	}
 
 	shopSubtotals := map[primitive.ObjectID]float64{}
 	for _, item := range tx.Items {
@@ -633,9 +685,11 @@ func PayTransaction(c *fiber.Ctx) error {
 			shopSubtotals[item.ShopID] += item.Price * float64(item.Quantity)
 		}
 	}
+	tx.Status = "pending"
 	tx.EscrowStatus = "held"
 	tx.PaymentMethod = method
 	holdEscrowFunds(tx, shopSubtotals)
+	tx.PaymentToken = ""
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Pembayaran berhasil diverifikasi secara real-time! Dana ditahan di Escrow.", tx)
 }
@@ -667,16 +721,17 @@ func GetPaymentStatus(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Anda tidak memiliki akses ke status pembayaran pesanan ini")
 	}
 
-	// Auto-cancel bila pending_payment sudah lewat batas waktu 15 menit
+	// Auto-cancel bila pending_payment sudah lewat batas waktu 15 menit (atomik agar stok tidak dikembalikan ganda)
 	if tx.Status == "pending_payment" && tx.PaymentExpiresAt != nil && time.Now().After(tx.PaymentExpiresAt.Time()) {
-		_, _ = config.DB.Collection("transactions").UpdateOne(
+		if res, err := config.DB.Collection("transactions").UpdateOne(
 			ctx,
-			bson.M{"_id": oid},
-			bson.M{"$set": bson.M{"status": "cancelled", "escrow_status": "refunded"}},
-		)
-		refundEscrowAndRestoreStock(ctx, tx, true)
-		tx.Status = "cancelled"
-		tx.EscrowStatus = "refunded"
+			bson.M{"_id": oid, "status": "pending_payment"},
+			bson.M{"$set": bson.M{"status": "cancelled", "escrow_status": "unpaid"}},
+		); err == nil && res.ModifiedCount == 1 {
+			refundEscrowAndRestoreStock(ctx, tx, true)
+			tx.Status = "cancelled"
+			tx.EscrowStatus = "unpaid"
+		}
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Payment status retrieved", fiber.Map{
@@ -701,57 +756,38 @@ func ListTransactions(c *fiber.Ctx) error {
 	}
 	maybeSweepAutoComplete()
 
-	// If shop_id is provided, find all transactions containing items for this shop (requires seller ownership or admin)
-	shopID := strings.TrimSpace(c.Query("shop_id"))
-	if shopID != "" {
-		authUser, aerr := requireAuth(c)
-		if authUser == nil {
-			return aerr
-		}
-		shopOID, err := primitive.ObjectIDFromHex(shopID)
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	filter := bson.M{}
+	maskForAdmin := authUser.Role == "admin" && c.Query("mine") != "1"
+	switch {
+	case strings.TrimSpace(c.Query("shop_id")) != "":
+		// Pesanan sebuah ruko: khusus pemilik ruko atau admin
+		shopOID, err := primitive.ObjectIDFromHex(strings.TrimSpace(c.Query("shop_id")))
 		if err != nil {
 			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid shop_id format")
 		}
 		if authUser.Role != "admin" {
-			var shop model.Shop
-			if err := config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": shopOID}).Decode(&shop); err != nil {
+			shop, err := loadShop(ctx, shopOID)
+			if err != nil {
 				return helper.ErrorResponse(c, fiber.StatusNotFound, "Shop not found")
 			}
-			if shop.OwnerID != authUser.ID {
+			if !isShopOwner(shop, authUser.ID) {
 				return helper.ErrorResponse(c, fiber.StatusForbidden, "Akses ditolak: Anda bukan pemilik ruko ini.")
 			}
 		}
-
-		filter := bson.M{
-			"items.shop_id": shopOID,
-		}
-
-		cursor, err := config.DB.Collection("transactions").Find(context.Background(), filter)
-		if err != nil {
-			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve transactions")
-		}
-		defer cursor.Close(context.Background())
-
-		var transactions []model.Transaction = []model.Transaction{}
-		if err = cursor.All(context.Background(), &transactions); err != nil {
-			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding transactions list")
-		}
-		for i := range transactions {
-			transactions[i].PaymentToken = ""
-		}
-
-		return helper.SuccessResponse(c, fiber.StatusOK, "Transactions retrieved successfully", transactions)
-	}
-
-	// Filter by buyer_id if provided (requires matching buyer or admin)
-	filter := bson.M{}
-	buyerID := strings.TrimSpace(c.Query("buyer_id"))
-	if buyerID != "" {
-		authUser, aerr := requireAuth(c)
-		if authUser == nil {
-			return aerr
-		}
-		buyerOID, err := primitive.ObjectIDFromHex(buyerID)
+		filter["$or"] = []bson.M{{"shop_id": shopOID}, {"items.shop_id": shopOID}}
+	case c.Query("mine") == "1":
+		// Pesanan saya sebagai pembeli (juga untuk admin/penjual yang berbelanja)
+		filter["buyer_id"] = authUser.ID
+	case strings.TrimSpace(c.Query("buyer_id")) != "":
+		// Pesanan seorang pembeli: dirinya sendiri atau admin
+		buyerOID, err := primitive.ObjectIDFromHex(strings.TrimSpace(c.Query("buyer_id")))
 		if err != nil {
 			return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid buyer_id format")
 		}
@@ -759,78 +795,93 @@ func ListTransactions(c *fiber.Ctx) error {
 			return helper.ErrorResponse(c, fiber.StatusForbidden, "Akses ditolak: Anda hanya dapat melihat transaksi milik Anda sendiri.")
 		}
 		filter["buyer_id"] = buyerOID
-
-		cursor, err := config.DB.Collection("transactions").Find(context.Background(), filter)
-		if err != nil {
-			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve transactions")
-		}
-		defer cursor.Close(context.Background())
-
-		var transactions []model.Transaction = []model.Transaction{}
-		if err = cursor.All(context.Background(), &transactions); err != nil {
-			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding transactions list")
-		}
-		return helper.SuccessResponse(c, fiber.StatusOK, "Transactions retrieved successfully", transactions)
+	case authUser.Role == "admin":
+		// Semua transaksi (konsol admin); data pribadi pembeli disamarkan
+		maskForAdmin = true
+	default:
+		filter["buyer_id"] = authUser.ID
 	}
 
-	cursor, err := config.DB.Collection("transactions").Find(context.Background(), filter)
+	cursor, err := config.DB.Collection("transactions").Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve transactions")
 	}
-	defer cursor.Close(context.Background())
+	defer cursor.Close(ctx)
 
 	var transactions []model.Transaction = []model.Transaction{}
-	if err = cursor.All(context.Background(), &transactions); err != nil {
+	if err = cursor.All(ctx, &transactions); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding transactions list")
 	}
-
-	authUser := AuthUser(c)
-	if authUser != nil && authUser.Role == "admin" {
-		// Privasi Data: Jika Admin yang mengambil daftar semua transaksi, samarkan alamat & nama penerima pakai bintang ****
-		for i := range transactions {
+	for i := range transactions {
+		transactions[i].PaymentToken = ""
+		if maskForAdmin {
+			// Privasi data: admin tidak melihat alamat & nama penerima asli
 			transactions[i].ShippingAddress = helper.MaskAddress(transactions[i].ShippingAddress)
 			transactions[i].RecipientName = helper.MaskAddress(transactions[i].RecipientName)
-			transactions[i].PaymentToken = ""
-		}
-	} else {
-		// Katalog publik (untuk perhitungan jumlah terjual): bersihkan seluruh informasi pribadi & finansial pembeli
-		for i := range transactions {
-			transactions[i].BuyerID = primitive.NilObjectID
-			transactions[i].RecipientName = ""
-			transactions[i].ShippingAddress = ""
-			transactions[i].PaymentToken = ""
-			transactions[i].TrackingNumber = ""
-			transactions[i].TrackingHistory = nil
-			transactions[i].RouteOrigin = nil
-			transactions[i].RouteDestination = nil
-			transactions[i].CurrentLocation = nil
 		}
 	}
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "Transactions retrieved successfully", transactions)
 }
 
-// FixTransactionStatus updates all pending_payment transactions to success (one-time migration)
-func FixTransactionStatus(c *fiber.Ctx) error {
+// GetTransaction menangani GET /api/transaction/:id (detail satu pesanan untuk pembeli, pemilik ruko, atau admin).
+func GetTransaction(c *fiber.Ctx) error {
 	if config.DB == nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
 	}
-
+	authUser, aerr := requireAuth(c)
+	if authUser == nil {
+		return aerr
+	}
+	oid, err := primitive.ObjectIDFromHex(c.Params("id"))
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid transaction ID")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	result, err := config.DB.Collection("transactions").UpdateMany(
-		ctx,
-		bson.M{"status": "pending_payment"},
-		bson.M{"$set": bson.M{"status": "success"}},
-	)
-	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to update transactions")
+	var tx model.Transaction
+	if err := config.DB.Collection("transactions").FindOne(ctx, bson.M{"_id": oid}).Decode(&tx); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Transaction not found")
 	}
+	if authUser.Role != "admin" && tx.BuyerID != authUser.ID && !userSellsInTx(ctx, authUser, tx) {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, "Anda tidak memiliki akses ke pesanan ini")
+	}
+	tx.PaymentToken = ""
+	if authUser.Role == "admin" && tx.BuyerID != authUser.ID {
+		tx.ShippingAddress = helper.MaskAddress(tx.ShippingAddress)
+		tx.RecipientName = helper.MaskAddress(tx.RecipientName)
+	}
+	return helper.SuccessResponse(c, fiber.StatusOK, "Transaction retrieved successfully", tx)
+}
 
-	return helper.SuccessResponse(c, fiber.StatusOK, "Transactions updated successfully", fiber.Map{
-		"updated_count": result.ModifiedCount,
+// GET /api/products/sold — jumlah terjual per produk (tanpa data pembeli), untuk katalog publik.
+func SoldCounts(c *fiber.Ctx) error {
+	if config.DB == nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cur, err := config.DB.Collection("transactions").Aggregate(ctx, mongo.Pipeline{
+		{{Key: "$match", Value: bson.M{"status": bson.M{"$ne": "cancelled"}}}},
+		{{Key: "$unwind", Value: "$items"}},
+		{{Key: "$group", Value: bson.M{"_id": "$items.product_id", "n": bson.M{"$sum": "$items.quantity"}}}},
 	})
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal menghitung penjualan")
+	}
+	defer cur.Close(ctx)
+	out := map[string]int{}
+	for cur.Next(ctx) {
+		var row struct {
+			ID primitive.ObjectID `bson:"_id"`
+			N  int                `bson:"n"`
+		}
+		if cur.Decode(&row) == nil {
+			out[row.ID.Hex()] = row.N
+		}
+	}
+	return helper.SuccessResponse(c, fiber.StatusOK, "ok", out)
 }
 
 // buildTrackingStateForStatus menyusun checkpoint kurir & koordinat peta otomatis saat status pesanan berubah.
@@ -992,7 +1043,7 @@ func transitionAllowed(role string, from, to string) bool {
 		return (from == "shipped" && to == "success") ||
 			((from == "pending_payment" || from == "pending") && to == "cancelled")
 	case "seller":
-		return ((from == "pending" || from == "pending_payment") && to == "paid") ||
+		return (from == "pending" && to == "paid") ||
 			(from == "paid" && to == "shipped") ||
 			((from == "pending" || from == "paid") && to == "cancelled")
 	}
@@ -1035,6 +1086,9 @@ func applyStatusChange(ctx context.Context, tx model.Transaction, newStatus, cou
 
 	now := time.Now()
 	nowDT := primitive.NewDateTimeFromTime(now)
+	shouldRelease := false
+	shouldRefund := false
+	restock := false
 	switch {
 	case newStatus == "shipped":
 		// Mulai hitung mundur auto-complete
@@ -1044,17 +1098,29 @@ func applyStatusChange(ctx context.Context, tx model.Transaction, newStatus, cou
 	case newStatus == "success" && tx.EscrowStatus != "released":
 		setFields["escrow_status"] = "released"
 		setFields["released_at"] = nowDT
-		releaseEscrowFunds(ctx, tx)
+		shouldRelease = true
 	case newStatus == "cancelled" && tx.Status != "cancelled":
-		restock := tx.Status != "shipped" && tx.Status != "disputed"
+		restock = tx.Status != "shipped" && tx.Status != "disputed"
 		if tx.EscrowStatus == "held" {
 			setFields["escrow_status"] = "refunded"
 		}
-		refundEscrowAndRestoreStock(ctx, tx, restock)
+		shouldRefund = true
 	}
 
-	if _, err := config.DB.Collection("transactions").UpdateOne(ctx, bson.M{"_id": tx.ID}, bson.M{"$set": setFields}); err != nil {
+	// Kunci status secara atomik sebelum mencairkan escrow / mengembalikan stok (mencegah double release/restock)
+	res, err := config.DB.Collection("transactions").UpdateOne(ctx, bson.M{"_id": tx.ID, "status": tx.Status}, bson.M{"$set": setFields})
+	if err != nil {
 		return nil, err
+	}
+	if res.ModifiedCount == 0 {
+		return nil, fmt.Errorf("status pesanan sudah berubah, muat ulang halaman")
+	}
+
+	if shouldRelease {
+		releaseEscrowFunds(ctx, tx)
+	}
+	if shouldRefund {
+		refundEscrowAndRestoreStock(ctx, tx, restock)
 	}
 
 	switch newStatus {
@@ -1197,6 +1263,7 @@ func AutoCompleteDueOrders() int {
 		if err != nil || res.ModifiedCount == 0 {
 			continue
 		}
+		tx.Status = "success_pending_release"
 		setFields, err := applyStatusChange(ctx, tx, "success", "", "")
 		if err != nil {
 			_, _ = config.DB.Collection("transactions").UpdateOne(ctx, bson.M{"_id": tx.ID}, bson.M{"$set": bson.M{"status": "shipped"}})
@@ -1228,7 +1295,7 @@ func AutoCompleteDueOrders() int {
 			if uerr != nil || res.ModifiedCount == 0 {
 				continue
 			}
-			tx.Status = "pending"
+			tx.Status = "cancelling_auto"
 			if _, aerr := applyStatusChange(ctx, tx, "cancelled", "", ""); aerr != nil {
 				_, _ = config.DB.Collection("transactions").UpdateOne(ctx, bson.M{"_id": tx.ID}, bson.M{"$set": bson.M{"status": "pending"}})
 				continue
@@ -1309,15 +1376,21 @@ func CancelStalePendingOrders(c *fiber.Ctx) error {
 	})
 }
 
-var lastAutoSweep time.Time
+var (
+	autoSweepMu   sync.Mutex
+	lastAutoSweep time.Time
+)
 
 // maybeSweepAutoComplete menjalankan penyelesaian otomatis secara lazy (maks. 1x/menit) —
 // berguna di hosting serverless (Vercel) yang tidak punya proses latar belakang.
 func maybeSweepAutoComplete() {
+	autoSweepMu.Lock()
 	if time.Since(lastAutoSweep) < time.Minute {
+		autoSweepMu.Unlock()
 		return
 	}
 	lastAutoSweep = time.Now()
+	autoSweepMu.Unlock()
 	go AutoCompleteDueOrders()
 }
 

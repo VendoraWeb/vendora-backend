@@ -14,6 +14,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 type ProductReq struct {
@@ -41,6 +42,7 @@ const (
 // batasi jumlah, dan tolak tambahan harga negatif yang membuat harga <= 0.
 func cleanOptions(groups []model.OptionGroup, basePrice float64) ([]model.OptionGroup, string) {
 	out := []model.OptionGroup{}
+	minDeltaSum := 0.0
 	for _, g := range groups {
 		g.Name = strings.TrimSpace(g.Name)
 		if g.Name == "" {
@@ -48,6 +50,8 @@ func cleanOptions(groups []model.OptionGroup, basePrice float64) ([]model.Option
 		}
 		seen := map[string]bool{}
 		vals := []model.OptionValue{}
+		groupMin := 0.0
+		hasGroupMin := false
 		for _, v := range g.Values {
 			v.Label = strings.TrimSpace(v.Label)
 			key := strings.ToLower(v.Label)
@@ -56,6 +60,10 @@ func cleanOptions(groups []model.OptionGroup, basePrice float64) ([]model.Option
 			}
 			if basePrice > 0 && basePrice+v.PriceDelta <= 0 {
 				return nil, "Tambahan harga variasi \"" + v.Label + "\" membuat harga jadi nol atau minus"
+			}
+			if !hasGroupMin || v.PriceDelta < groupMin {
+				groupMin = v.PriceDelta
+				hasGroupMin = true
 			}
 			seen[key] = true
 			vals = append(vals, v)
@@ -66,8 +74,14 @@ func cleanOptions(groups []model.OptionGroup, basePrice float64) ([]model.Option
 		if len(vals) > maxOptionValues {
 			return nil, "Maksimal 12 pilihan untuk variasi " + g.Name
 		}
+		if hasGroupMin && groupMin < 0 {
+			minDeltaSum += groupMin
+		}
 		g.Values = vals
 		out = append(out, g)
+	}
+	if basePrice > 0 && basePrice+minDeltaSum <= 0 {
+		return nil, "Kombinasi potongan harga variasi membuat harga akhir jadi nol atau minus"
 	}
 	if len(out) > maxOptionGroups {
 		return nil, "Maksimal 3 jenis variasi per produk"
@@ -114,8 +128,8 @@ func AddProduct(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan menambah produk ke ruko milik penjual lain")
 	}
 
-	if EffectiveShopStatus(shop) != "active" {
-		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak dapat menambah produk: Ruko sedang jatuh tempo atau ditangguhkan")
+	if msg := sellBlockReason(&shop); msg != "" {
+		return helper.ErrorResponse(c, fiber.StatusForbidden, msg)
 	}
 
 	newProduct := model.Product{
@@ -187,47 +201,75 @@ func AddProduct(c *fiber.Ctx) error {
 	return helper.SuccessResponse(c, fiber.StatusCreated, "Product added successfully", newProduct)
 }
 
+// sellBlockReason: alasan ruko belum/tidak boleh berjualan ("" = boleh).
+func sellBlockReason(s *model.Shop) string {
+	switch effectiveStatus(s) {
+	case "active":
+		return ""
+	case "pending":
+		return "Ruko masih menunggu verifikasi admin. Produk bisa ditambahkan setelah ruko disetujui."
+	case "expired":
+		return "Masa sewa ruko sudah habis. Perpanjang sewa untuk berjualan lagi."
+	default:
+		return "Ruko sedang ditangguhkan admin."
+	}
+}
+
 func ListProducts(c *fiber.Ctx) error {
 	if config.DB == nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 
 	filter := bson.M{}
-	shopID := c.Query("shop_id")
-	if shopID != "" {
+	if shopID := c.Query("shop_id"); shopID != "" {
 		shopOID, err := primitive.ObjectIDFromHex(shopID)
-		if err == nil {
-			filter["shop_id"] = shopOID
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusBadRequest, "shop_id tidak valid")
+		}
+		filter["shop_id"] = shopOID
+		// Pemilik ruko & admin melihat semua produknya; pembeli hanya produk tampil dari ruko yang aktif
+		u := currentUser(c)
+		shop, err := loadShop(ctx, shopOID)
+		if err != nil {
+			return helper.SuccessResponse(c, fiber.StatusOK, "Products list retrieved successfully", []model.Product{})
+		}
+		if u == nil || (!isAdmin(u) && !isShopOwner(shop, u.ID)) {
+			if effectiveStatus(shop) != "active" {
+				return helper.SuccessResponse(c, fiber.StatusOK, "Products list retrieved successfully", []model.Product{})
+			}
+			filter["hidden"] = bson.M{"$ne": true}
 		}
 	} else {
-		// Sembunyikan produk yang di-hide moderator dan produk dari ruko yang ditangguhkan atau jatuh tempo dari katalog publik pembeli (EffectiveShopStatus(shop) == "active")
+		// Katalog publik: tanpa produk yang disembunyikan moderator, hanya dari ruko yang
+		// disetujui admin dan masa sewanya masih berjalan
 		filter["hidden"] = bson.M{"$ne": true}
-		activeCursor, err := config.DB.Collection("shops").Find(context.Background(), bson.M{"status": "active"})
-		if err == nil {
-			var activeShops []model.Shop
-			if err = activeCursor.All(context.Background(), &activeShops); err == nil {
-				var activeShopOIDs []primitive.ObjectID
-				for _, shop := range activeShops {
-					if EffectiveShopStatus(shop) == "active" {
-						activeShopOIDs = append(activeShopOIDs, shop.ID)
-					}
-				}
-				if len(activeShopOIDs) == 0 {
-					return helper.SuccessResponse(c, fiber.StatusOK, "Products list retrieved successfully", []model.Product{})
-				}
-				filter["shop_id"] = bson.M{"$in": activeShopOIDs}
+		cur, err := shopsCol().Find(ctx, activeShopFilter(), options.Find().SetProjection(bson.M{"_id": 1}))
+		if err != nil {
+			return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal memuat katalog")
+		}
+		ids := []primitive.ObjectID{}
+		for cur.Next(ctx) {
+			var row struct {
+				ID primitive.ObjectID `bson:"_id"`
+			}
+			if cur.Decode(&row) == nil {
+				ids = append(ids, row.ID)
 			}
 		}
+		cur.Close(ctx)
+		filter["shop_id"] = bson.M{"$in": ids}
 	}
 
-	cursor, err := config.DB.Collection("products").Find(context.Background(), filter)
+	cursor, err := productsCol().Find(ctx, filter)
 	if err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve products")
 	}
-	defer cursor.Close(context.Background())
+	defer cursor.Close(ctx)
 
 	var products []model.Product = []model.Product{}
-	if err = cursor.All(context.Background(), &products); err != nil {
+	if err = cursor.All(ctx, &products); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding products list")
 	}
 
@@ -249,9 +291,19 @@ func GetProduct(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Product ID format")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	var product model.Product
-	err = config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&product)
+	err = config.DB.Collection("products").FindOne(ctx, bson.M{"_id": oid}).Decode(&product)
 	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found")
+	}
+
+	u := currentUser(c)
+	shop, shopErr := loadShop(ctx, product.ShopID)
+	canManage := u != nil && (isAdmin(u) || (shopErr == nil && isShopOwner(shop, u.ID)))
+	if !canManage && (product.Hidden || shopErr != nil || effectiveStatus(shop) != "active") {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found")
 	}
 
@@ -287,7 +339,6 @@ func UpdateProduct(c *fiber.Ctx) error {
 	if err := config.DB.Collection("products").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&currentProd); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusNotFound, "Product not found")
 	}
-	hasCurrent := true
 
 	var shop model.Shop
 	if err := config.DB.Collection("shops").FindOne(context.Background(), bson.M{"_id": currentProd.ShopID}).Decode(&shop); err != nil {
@@ -324,7 +375,7 @@ func UpdateProduct(c *fiber.Ctx) error {
 
 	if req.Options != nil {
 		price := req.Price
-		if price <= 0 && hasCurrent {
+		if price <= 0 {
 			price = currentProd.Price
 		}
 		opts, msg := cleanOptions(*req.Options, price)
@@ -345,7 +396,7 @@ func UpdateProduct(c *fiber.Ctx) error {
 	var basePriceVal float64
 	if req.PromoPrice != nil {
 		basePriceVal = req.Price
-		if basePriceVal <= 0 && hasCurrent {
+		if basePriceVal <= 0 {
 			basePriceVal = currentProd.Price
 		}
 		if *req.PromoPrice <= 0 {
@@ -368,7 +419,7 @@ func UpdateProduct(c *fiber.Ctx) error {
 			} else {
 				updateFields["promo_label"] = fmt.Sprintf("Hemat %d%%", promoDiscount)
 			}
-			if !hasCurrent || currentProd.PromoPrice != promoPriceVal {
+			if currentProd.PromoPrice != promoPriceVal {
 				notifyPromo = true
 			}
 		}

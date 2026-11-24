@@ -16,6 +16,7 @@ import (
 
 type UpdateProfileReq struct {
 	UserID  string `json:"user_id"`
+	Name    string `json:"name"` // kosong = nama tidak diubah
 	Email   string `json:"email"`
 	Phone   string `json:"phone"`
 	Address string `json:"address"`
@@ -23,29 +24,22 @@ type UpdateProfileReq struct {
 }
 
 func UpdateProfile(c *fiber.Ctx) error {
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
-	}
-
-	authUser, aerr := requireAuth(c)
-	if authUser == nil {
-		return aerr
-	}
-
 	var req UpdateProfileReq
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid request body",
+			"error": "Permintaan tidak valid",
 		})
 	}
 
-	if strings.TrimSpace(req.UserID) != "" && strings.TrimSpace(req.UserID) != authUser.ID.Hex() {
-		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Tidak diizinkan mengubah profil akun pengguna lain",
-		})
+	// Profil yang diubah selalu milik pengguna yang sedang masuk (admin boleh mengubah akun lain)
+	objID := currentUser(c).ID
+	if isAdmin(currentUser(c)) && strings.TrimSpace(req.UserID) != "" {
+		id, err := primitive.ObjectIDFromHex(strings.TrimSpace(req.UserID))
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "ID pengguna tidak valid"})
+		}
+		objID = id
 	}
-
-	objID := authUser.ID
 
 	collection := config.DB.Collection("users")
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
@@ -54,6 +48,11 @@ func UpdateProfile(c *fiber.Ctx) error {
 	var current model.User
 	if err := collection.FindOne(ctx, bson.M{"_id": objID}).Decode(&current); err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "Akun tidak ditemukan"})
+	}
+
+	req.Name = strings.Join(strings.Fields(req.Name), " ")
+	if req.Name != "" && (len([]rune(req.Name)) < 2 || len([]rune(req.Name)) > 60) {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "Nama 2–60 karakter"})
 	}
 
 	// Email & nomor HP dipakai untuk login + OTP, jadi harus valid dan unik.
@@ -94,6 +93,9 @@ func UpdateProfile(c *fiber.Ctx) error {
 		"address":    req.Address,
 		"avatar":     req.Avatar,
 	}
+	if req.Name != "" {
+		set["name"] = req.Name
+	}
 	// Ganti email/nomor → status terverifikasi kembali false sampai OTP berikutnya
 	if !strings.EqualFold(req.Email, current.Email) {
 		set["email_verified"] = false
@@ -106,7 +108,7 @@ func UpdateProfile(c *fiber.Ctx) error {
 	_, err := collection.UpdateOne(ctx, bson.M{"_id": objID}, update)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-			"error": "Failed to update profile",
+			"error": "Gagal menyimpan profil",
 		})
 	}
 
@@ -124,7 +126,7 @@ func UpdateProfile(c *fiber.Ctx) error {
 // ListUsers returns all registered users (admin only)
 func ListUsers(c *fiber.Ctx) error {
 	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -138,16 +140,16 @@ func ListUsers(c *fiber.Ctx) error {
 
 	cursor, err := config.DB.Collection("users").Find(ctx, filter)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve users")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal memuat pengguna")
 	}
 	defer cursor.Close(ctx)
 
 	var users []model.User
 	if err = cursor.All(ctx, &users); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Error decoding users list")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal membaca pengguna")
 	}
 
-	// Privasi Data (Admin tidak boleh melihat email, nomor HP, atau alamat asli pengguna)
+	// Privasi data: admin tidak melihat email, nomor HP, atau alamat asli pengguna lain
 	for i := range users {
 		if users[i].Role != "admin" {
 			users[i].Email = helper.MaskEmail(users[i].Email)
@@ -156,7 +158,7 @@ func ListUsers(c *fiber.Ctx) error {
 		}
 	}
 
-	return helper.SuccessResponse(c, fiber.StatusOK, "Users retrieved successfully", users)
+	return helper.SuccessResponse(c, fiber.StatusOK, "Daftar pengguna", users)
 }
 
 type BanUserReq struct {
@@ -166,22 +168,33 @@ type BanUserReq struct {
 // BanUser toggles the banned status of a user (admin only)
 func BanUser(c *fiber.Ctx) error {
 	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database belum terhubung")
 	}
 
 	userID := c.Params("id")
 	objID, err := primitive.ObjectIDFromHex(userID)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid user ID")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "ID pengguna tidak valid")
 	}
 
 	var req BanUserReq
 	if err := c.BodyParser(&req); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request body")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
+	var target model.User
+	if err := config.DB.Collection("users").FindOne(ctx, bson.M{"_id": objID}).Decode(&target); err != nil {
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Pengguna tidak ditemukan")
+	}
+	if target.Role == "admin" || target.ID == currentUser(c).ID {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Akun admin tidak bisa diblokir")
+	}
+	if req.Banned {
+		revokeUserSessions(ctx, objID) // keluarkan dari semua perangkat
+	}
 
 	update := bson.M{
 		"$set": bson.M{"banned": req.Banned},
@@ -189,13 +202,8 @@ func BanUser(c *fiber.Ctx) error {
 
 	res, err := config.DB.Collection("users").UpdateOne(ctx, bson.M{"_id": objID}, update)
 	if err != nil || res.MatchedCount == 0 {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to update user status")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal mengubah status pengguna")
 	}
 
-	status := "unbanned"
-	if req.Banned {
-		status = "banned"
-	}
-
-	return helper.SuccessResponse(c, fiber.StatusOK, "User "+status+" successfully", nil)
+	return helper.SuccessResponse(c, fiber.StatusOK, "Status pengguna diperbarui", nil)
 }

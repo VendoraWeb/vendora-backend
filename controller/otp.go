@@ -186,12 +186,15 @@ func Login(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
+	identifier := strings.TrimSpace(req.Identifier)
+	if identifier == "" {
+		identifier = strings.TrimSpace(req.Email)
+	}
+	if identifier == "" || req.Password == "" {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Email/nomor HP dan kata sandi wajib diisi")
+	}
 	if !dbReady(c) {
 		return nil
-	}
-	identifier := req.Identifier
-	if identifier == "" {
-		identifier = req.Email
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -233,6 +236,9 @@ func SendOTP(c *fiber.Ctx) error {
 	var req SendOTPReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
+	}
+	if strings.TrimSpace(req.ChallengeID) == "" || (req.Channel != "email" && req.Channel != "phone") {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Pilih saluran email atau nomor HP")
 	}
 	if !dbReady(c) {
 		return nil
@@ -343,6 +349,9 @@ func VerifyOTP(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
+	if strings.TrimSpace(req.ChallengeID) == "" || len(strings.TrimSpace(req.Code)) != 6 {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Masukkan 6 digit kode verifikasi")
+	}
 	if !dbReady(c) {
 		return nil
 	}
@@ -411,7 +420,10 @@ func VerifyOTP(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Akun ini diblokir. Hubungi admin Vendora.")
 	}
 	_, _ = otpCol().UpdateOne(ctx, bson.M{"_id": ch.ID}, bson.M{"$set": bson.M{"verified": true, "used": true}})
-	sessionToken, _ := IssueSession(user.ID)
+	sessionToken, err := IssueSession(user.ID)
+	if err != nil {
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal membuat sesi")
+	}
 	if !ch.DevMode && ch.Channel == "email" {
 		user.EmailVerified = true
 	} else if !ch.DevMode && ch.Channel == "phone" {
@@ -432,6 +444,9 @@ func ResetStart(c *fiber.Ctx) error {
 	var req ResetStartReq
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
+	}
+	if strings.TrimSpace(req.Identifier) == "" {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Masukkan email atau nomor HP akun")
 	}
 	if !dbReady(c) {
 		return nil
@@ -472,11 +487,11 @@ func ResetComplete(c *fiber.Ctx) error {
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
-	if !dbReady(c) {
-		return nil
-	}
 	if len(req.NewPassword) < minPasswordChars {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Kata sandi minimal 8 karakter")
+	}
+	if !dbReady(c) {
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -496,6 +511,8 @@ func ResetComplete(c *fiber.Ctx) error {
 	// tandai selesai + batalkan sesi verifikasi lain milik akun ini
 	_, _ = otpCol().UpdateOne(ctx, bson.M{"_id": ch.ID}, bson.M{"$set": bson.M{"used": true}})
 	_, _ = otpCol().UpdateMany(ctx, bson.M{"user_id": ch.UserID, "used": false}, bson.M{"$set": bson.M{"used": true}})
+	// Kata sandi baru → keluarkan semua perangkat yang masih masuk dengan kata sandi lama
+	revokeUserSessions(ctx, ch.UserID)
 	return helper.SuccessResponse(c, fiber.StatusOK, "Kata sandi berhasil diubah. Silakan masuk.", nil)
 }
 

@@ -112,10 +112,3 @@ func MaskPhone(e164 string) string {
 	local := e164[2:]
 	return "+62 " + local[:3] + "-****-" + local[len(local)-3:]
 }
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}

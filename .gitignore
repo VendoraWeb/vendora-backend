@@ -13,6 +13,7 @@ tmp*
 
 # Output of go coverage
 *.out
+coverage.html
 output.txt
 
 # Node (in case any scripts run)

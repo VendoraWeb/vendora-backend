@@ -10,6 +10,7 @@ type Message struct {
 	Text       string              `bson:"text" json:"text"`
 	Image      string              `bson:"image,omitempty" json:"image,omitempty"` // ID foto di koleksi chat_media
 	ReadAt     *primitive.DateTime `bson:"read_at,omitempty" json:"read_at,omitempty"`
+	Auto       bool                `bson:"auto,omitempty" json:"auto,omitempty"` // salam otomatis toko (dikirim sistem atas nama ruko)
 	CreatedAt  primitive.DateTime  `bson:"created_at" json:"created_at"`
 }
 

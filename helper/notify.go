@@ -34,15 +34,6 @@ var httpClient = &http.Client{Timeout: 12 * time.Second}
 //     OTP_DEV_LOG=true  → bila penyedia belum diatur, kode dicetak di log server
 //                         (JANGAN aktifkan di production).
 
-func EmailProviderReady() bool {
-	return os.Getenv("RESEND_API_KEY") != "" || os.Getenv("SMTP_HOST") != ""
-}
-
-func PhoneProviderReady() bool {
-	return os.Getenv("FONNTE_TOKEN") != "" ||
-		(os.Getenv("TWILIO_ACCOUNT_SID") != "" && os.Getenv("TWILIO_AUTH_TOKEN") != "" && os.Getenv("TWILIO_FROM") != "")
-}
-
 func devLogEnabled() bool { return strings.EqualFold(os.Getenv("OTP_DEV_LOG"), "true") }
 
 func purposeText(purpose string) string {

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"vendora/config"
@@ -20,33 +21,27 @@ type CreateTicketReq struct {
 }
 
 func CreateTicket(c *fiber.Ctx) error {
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
-	}
-	authUser, aerr := requireAuth(c)
-	if authUser == nil {
-		return aerr
-	}
-
 	var req CreateTicketReq
 	if err := c.BodyParser(&req); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
 
+	req.Subject, req.Message = strings.TrimSpace(req.Subject), strings.TrimSpace(req.Message)
 	if req.Subject == "" || req.Message == "" {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Subject and Message are required")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Topik dan pesan wajib diisi")
 	}
-
-	if req.SellerID != "" && req.SellerID != authUser.ID.Hex() {
-		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan membuat tiket atas nama pengguna lain")
+	if len([]rune(req.Message)) > 2000 || len([]rune(req.Subject)) > 120 {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Pesan terlalu panjang")
 	}
-	sellerOID := authUser.ID
+	// Tiket selalu atas nama pengguna yang sedang masuk
+	sellerOID := currentUser(c).ID
+	var err error
 
 	// Find seller user to get name
 	var seller model.User
-	err := config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": sellerOID}).Decode(&seller)
+	err = config.DB.Collection("users").FindOne(context.Background(), bson.M{"_id": sellerOID}).Decode(&seller)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusNotFound, "Seller not found")
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Akun tidak ditemukan")
 	}
 
 	newTicket := model.SupportTicket{
@@ -63,53 +58,41 @@ func CreateTicket(c *fiber.Ctx) error {
 
 	_, err = config.DB.Collection("tickets").InsertOne(context.Background(), newTicket)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to create support ticket")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal mengirim pertanyaan")
 	}
 
-	return helper.SuccessResponse(c, fiber.StatusCreated, "Ticket created successfully", newTicket)
+	return helper.SuccessResponse(c, fiber.StatusCreated, "Pertanyaan terkirim", newTicket)
 }
 
 func ListTickets(c *fiber.Ctx) error {
-	if config.DB == nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Database connection not initialized")
-	}
-	authUser, aerr := requireAuth(c)
-	if authUser == nil {
-		return aerr
-	}
-
+	// Admin melihat semua tiket; pengguna lain hanya tiketnya sendiri
 	filter := bson.M{}
-	sellerID := c.Query("seller_id")
-	if authUser.Role != "admin" {
-		if sellerID != "" && sellerID != authUser.ID.Hex() {
-			return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan membaca tiket pengguna lain")
-		}
-		filter["seller_id"] = authUser.ID
-	} else if sellerID != "" {
-		sellerOID, err := primitive.ObjectIDFromHex(sellerID)
-		if err == nil {
+	if u := currentUser(c); !isAdmin(u) {
+		filter["seller_id"] = u.ID
+	} else if sellerID := c.Query("seller_id"); sellerID != "" {
+		if sellerOID, err := primitive.ObjectIDFromHex(sellerID); err == nil {
 			filter["seller_id"] = sellerOID
 		}
 	}
 
 	cursor, err := config.DB.Collection("tickets").Find(context.Background(), filter)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to retrieve tickets")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal memuat tiket")
 	}
 	defer cursor.Close(context.Background())
 
 	var tickets []model.SupportTicket = []model.SupportTicket{}
 	if err = cursor.All(context.Background(), &tickets); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to decode tickets list")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal membaca tiket")
 	}
 
-	return helper.SuccessResponse(c, fiber.StatusOK, "Tickets retrieved successfully", tickets)
+	return helper.SuccessResponse(c, fiber.StatusOK, "Daftar tiket", tickets)
 }
 
 func ReplyTicket(c *fiber.Ctx) error {
 	ticketID := c.Params("id")
 	if ticketID == "" {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Ticket ID is required")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "ID tiket wajib diisi")
 	}
 
 	type ReplyReq struct {
@@ -118,16 +101,17 @@ func ReplyTicket(c *fiber.Ctx) error {
 
 	var req ReplyReq
 	if err := c.BodyParser(&req); err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid request payload")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Permintaan tidak valid")
 	}
 
+	req.Reply = strings.TrimSpace(req.Reply)
 	if req.Reply == "" {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Reply content cannot be empty")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Balasan tidak boleh kosong")
 	}
 
 	oid, err := primitive.ObjectIDFromHex(ticketID)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Invalid Ticket ID format")
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "ID tiket tidak valid")
 	}
 
 	update := bson.M{
@@ -140,12 +124,17 @@ func ReplyTicket(c *fiber.Ctx) error {
 
 	result, err := config.DB.Collection("tickets").UpdateOne(context.Background(), bson.M{"_id": oid}, update)
 	if err != nil {
-		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to reply support ticket")
+		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Gagal membalas tiket")
 	}
 
 	if result.MatchedCount == 0 {
-		return helper.ErrorResponse(c, fiber.StatusNotFound, "Ticket not found")
+		return helper.ErrorResponse(c, fiber.StatusNotFound, "Tiket tidak ditemukan")
 	}
 
-	return helper.SuccessResponse(c, fiber.StatusOK, "Ticket replied and resolved successfully", nil)
+	var t model.SupportTicket
+	if config.DB.Collection("tickets").FindOne(context.Background(), bson.M{"_id": oid}).Decode(&t) == nil {
+		PushUserNotification(t.SellerID, "ticket", "Tim Vendora membalas: "+t.Subject, req.Reply, "bantuan.html#hubungi")
+	}
+
+	return helper.SuccessResponse(c, fiber.StatusOK, "Tiket dibalas", nil)
 }

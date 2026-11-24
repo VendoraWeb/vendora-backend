@@ -183,6 +183,12 @@ func ExportTransactionsCSV(c *fiber.Ctx) error {
 		if s == "processing" {
 			return "paid"
 		}
+		if s == "success_pending_release" {
+			return "success"
+		}
+		if s == "cancelling_auto" {
+			return "cancelled"
+		}
 		return s
 	}
 	statusLabel := map[string]string{
@@ -192,6 +198,16 @@ func ExportTransactionsCSV(c *fiber.Ctx) error {
 		"disputed":  "Komplain",
 		"success":   "Selesai",
 		"cancelled": "Dibatalkan",
+	}
+
+	safeCSVCell := func(s string) string {
+		if s != "" {
+			switch s[0] {
+			case '=', '+', '-', '@', '\t', '\r':
+				return "'" + s
+			}
+		}
+		return s
 	}
 
 	var buf bytes.Buffer
@@ -268,8 +284,8 @@ func ExportTransactionsCSV(c *fiber.Ctx) error {
 		_ = w.Write([]string{
 			t.ID.Hex(),
 			dateStr,
-			buyerName,
-			shopStr,
+			safeCSVCell(helper.MaskAddress(buyerName)),
+			safeCSVCell(shopStr),
 			stText,
 			fmt.Sprintf("%.0f", subtotal),
 			fmt.Sprintf("%.0f", shipping),
@@ -406,8 +422,9 @@ func ResolveAdminReport(c *fiber.Ctx) error {
 	}
 
 	var req struct {
-		Status string `json:"status"` // resolved | dismissed
-		Note   string `json:"note"`
+		Status    string `json:"status"` // resolved | dismissed
+		Note      string `json:"note"`
+		AdminNote string `json:"admin_note"`
 	}
 	if err := c.BodyParser(&req); err != nil {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Payload tidak valid")
@@ -415,7 +432,10 @@ func ResolveAdminReport(c *fiber.Ctx) error {
 	if req.Status != "resolved" && req.Status != "dismissed" {
 		req.Status = "resolved"
 	}
-	req.Note = strings.TrimSpace(req.Note)
+	note := strings.TrimSpace(req.Note)
+	if note == "" {
+		note = strings.TrimSpace(req.AdminNote)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
@@ -429,7 +449,7 @@ func ResolveAdminReport(c *fiber.Ctx) error {
 	_, err = config.DB.Collection("reports").UpdateOne(ctx, bson.M{"_id": oid}, bson.M{
 		"$set": bson.M{
 			"status":      req.Status,
-			"admin_note":  req.Note,
+			"admin_note":  note,
 			"resolved_at": nowDT,
 		},
 	})

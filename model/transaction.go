@@ -38,15 +38,16 @@ type Transaction struct {
 	RecipientName   string             `bson:"recipient_name" json:"recipient_name"`
 	ShippingAddress string             `bson:"shipping_address" json:"shipping_address"`
 	Items           []TransactionItem  `bson:"items" json:"items"`
+	ShopID          primitive.ObjectID `bson:"shop_id,omitempty" json:"shop_id,omitempty"` // satu pesanan = satu ruko
 
 	// Rincian Keuangan & Escrow (Rekening Bersama Admin)
-	SubtotalAmount  float64             `bson:"subtotal_amount" json:"subtotal_amount"`               // Total harga barang
-	ShippingCost    float64             `bson:"shipping_cost" json:"shipping_cost"`                   // Ongkos kirim kurir
-	PlatformFee     float64             `bson:"platform_fee" json:"platform_fee"`                     // Pajak/biaya layanan platform (2.5%)
-	SellerNetAmount float64             `bson:"seller_net_amount" json:"seller_net_amount"`           // Dana bersih yang cair ke penjual setelah pesanan diterima
-	TotalAmount     float64             `bson:"total_amount" json:"total_amount"`                     // Total yang dibayar pembeli (Subtotal + Ongkir)
-	EscrowStatus    string              `bson:"escrow_status" json:"escrow_status"`                   // unpaid, held (ditahan di Admin), released (cair ke Seller), refunded (kembali ke Buyer)
-	ReleasedAt      *primitive.DateTime `bson:"released_at,omitempty" json:"released_at,omitempty"`   // Waktu dana cair ke penjual
+	SubtotalAmount  float64             `bson:"subtotal_amount" json:"subtotal_amount"`             // Total harga barang
+	ShippingCost    float64             `bson:"shipping_cost" json:"shipping_cost"`                 // Ongkos kirim kurir
+	PlatformFee     float64             `bson:"platform_fee" json:"platform_fee"`                   // Pajak/biaya layanan platform (2.5%)
+	SellerNetAmount float64             `bson:"seller_net_amount" json:"seller_net_amount"`         // Dana bersih yang cair ke penjual setelah pesanan diterima
+	TotalAmount     float64             `bson:"total_amount" json:"total_amount"`                   // Total yang dibayar pembeli (Subtotal + Ongkir)
+	EscrowStatus    string              `bson:"escrow_status" json:"escrow_status"`                 // unpaid, held (ditahan di Admin), released (cair ke Seller), refunded (kembali ke Buyer)
+	ReleasedAt      *primitive.DateTime `bson:"released_at,omitempty" json:"released_at,omitempty"` // Waktu dana cair ke penjual
 
 	// Pembayaran Real-Time & Keamanan
 	PaymentMethod    string              `bson:"payment_method,omitempty" json:"payment_method,omitempty"`         // QRIS, VA_BCA, VA_MANDIRI, CARD, EWALLET
@@ -65,7 +66,7 @@ type Transaction struct {
 	CurrentLocation  *GeoLocation    `bson:"current_location,omitempty" json:"current_location,omitempty"`   // Posisi paket saat ini di peta
 	TrackingHistory  []TrackingEvent `bson:"tracking_history,omitempty" json:"tracking_history,omitempty"`   // Timeline perjalanan kurir
 
-	Status    string             `bson:"status" json:"status"` // pending_payment, pending, paid, shipped, success, cancelled, disputed
+	Status string `bson:"status" json:"status"` // pending_payment, pending, paid, shipped, success, cancelled, disputed
 	// Batas waktu penjual wajib mengonfirmasi pesanan baru (default 24 jam). Hanya diisi untuk pesanan baru agar data historis tidak dibatalkan otomatis saat startup.
 	ConfirmBy *primitive.DateTime `bson:"confirm_by,omitempty" json:"confirm_by,omitempty"`
 	// Batas waktu pesanan otomatis selesai (dana cair) bila pembeli tidak konfirmasi & tidak komplain.
@@ -86,7 +87,7 @@ type Dispute struct {
 	Description    string               `bson:"description" json:"description"`
 	Evidence       []string             `bson:"evidence,omitempty" json:"evidence,omitempty"` // URL foto bukti
 	SellerResponse string               `bson:"seller_response,omitempty" json:"seller_response,omitempty"`
-	Status         string               `bson:"status" json:"status"`                         // open, resolved_refund, resolved_release
+	Status         string               `bson:"status" json:"status"` // open, resolved_refund, resolved_release
 	AdminNote      string               `bson:"admin_note,omitempty" json:"admin_note,omitempty"`
 	Amount         float64              `bson:"amount" json:"amount"`
 	CreatedAt      primitive.DateTime   `bson:"created_at" json:"created_at"`

@@ -37,7 +37,10 @@ func loadEnv() {
 			key := strings.TrimSpace(parts[0])
 			val := strings.TrimSpace(parts[1])
 			val = strings.Trim(val, `"'`)
-			os.Setenv(key, val)
+			// Variabel yang sudah diset (Vercel, terminal) tidak ditimpa isi .env
+			if _, exists := os.LookupEnv(key); !exists {
+				os.Setenv(key, val)
+			}
 		}
 	}
 }
@@ -110,14 +113,18 @@ func seedData() {
 	}
 	_, _ = usersCol.InsertOne(ctx, adminUser)
 
-	// 2. Create Seller
+	// 2. Create Seller (langsung terhubung ke ruko awal)
 	sellerID := primitive.NewObjectID()
+	shopID := primitive.NewObjectID()
 	sellerUser := model.User{
 		ID:        sellerID,
 		Name:      "Nabila Store Official",
 		Email:     "seller@vendora.com",
 		Password:  hashPassword("seller123"),
 		Role:      "seller",
+		HasShop:   true,
+		ShopID:    shopID,
+		ShopName:  "Nabila Premium Goods",
 		CreatedAt: primitive.NewDateTimeFromTime(time.Now()),
 	}
 	_, _ = usersCol.InsertOne(ctx, sellerUser)
@@ -135,7 +142,6 @@ func seedData() {
 	_, _ = usersCol.InsertOne(ctx, buyerUser)
 
 	// 4. Create Active Shop
-	shopID := primitive.NewObjectID()
 	newShop := model.Shop{
 		ID:            shopID,
 		Name:          "Nabila Premium Goods",

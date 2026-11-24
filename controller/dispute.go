@@ -56,9 +56,18 @@ func CreateDispute(c *fiber.Ctx) error {
 	if len([]rune(req.Description)) < 10 {
 		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Jelaskan masalahnya minimal 10 karakter")
 	}
-	if len(req.Evidence) > 5 {
-		req.Evidence = req.Evidence[:5]
+	cleanEvidence := []string{}
+	for _, raw := range req.Evidence {
+		u := strings.TrimSpace(raw)
+		lower := strings.ToLower(u)
+		if (strings.HasPrefix(lower, "https://") || strings.HasPrefix(lower, "http://")) && !strings.ContainsAny(u, " \"<>'\\") {
+			cleanEvidence = append(cleanEvidence, u)
+			if len(cleanEvidence) >= 5 {
+				break
+			}
+		}
 	}
+	req.Evidence = cleanEvidence
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -101,7 +110,7 @@ func CreateDispute(c *fiber.Ctx) error {
 		Description:   req.Description,
 		Evidence:      req.Evidence,
 		Status:        "open",
-		Amount:        tx.SubtotalAmount,
+		Amount:        ComputeOrderSubtotal(tx),
 		CreatedAt:     primitive.NewDateTimeFromTime(time.Now()),
 	}
 	if _, err := config.DB.Collection("disputes").InsertOne(ctx, d); err != nil {
@@ -151,7 +160,10 @@ func ListDisputes(c *fiber.Ctx) error {
 		for _, s := range shops {
 			ids = append(ids, s.ID)
 		}
-		filter["shop_ids"] = bson.M{"$in": ids}
+		filter["$or"] = []bson.M{
+			{"shop_ids": bson.M{"$in": ids}},
+			{"buyer_id": user.ID},
+		}
 	default:
 		filter["buyer_id"] = user.ID
 	}

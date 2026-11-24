@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -104,6 +105,9 @@ func ListNotifications(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusInternalServerError, "Failed to decode notifications")
 	}
 
+	// Pengingat masa sewa ruko (dihitung saat dibaca, tidak disimpan)
+	list = append(leaseReminders(ctx, authUser), list...)
+
 	unreadCount := 0
 	for i := range list {
 		read := false
@@ -160,6 +164,17 @@ func CreateNotification(c *fiber.Ctx) error {
 	}
 	if req.Type == "" {
 		req.Type = "promo"
+	}
+	if authUser.Role != "admin" {
+		req.Type = "promo" // penjual hanya boleh mengirim promo
+	}
+	req.Link = safeNotifLink(req.Link)
+	req.Image = strings.TrimSpace(req.Image)
+	if req.Image != "" && !strings.HasPrefix(req.Image, "https://") {
+		req.Image = ""
+	}
+	if len([]rune(req.Title)) > 120 || len([]rune(req.Message)) > 500 {
+		return helper.ErrorResponse(c, fiber.StatusBadRequest, "Judul maksimal 120 karakter dan isi maksimal 500 karakter")
 	}
 
 	notif := model.Notification{
@@ -224,13 +239,24 @@ func MarkNotificationRead(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan menandai notifikasi pengguna lain")
 	}
 	userOID := authUser.ID
+	role := strings.ToLower(strings.TrimSpace(authUser.Role))
+	if role == "" {
+		role = "buyer"
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	_, _ = config.DB.Collection("notifications").UpdateOne(
 		ctx,
-		bson.M{"_id": notifOID},
+		bson.M{
+			"_id": notifOID,
+			"$or": []bson.M{
+				{"user_id": userOID},
+				{"target_role": "all"},
+				{"target_role": role},
+			},
+		},
 		bson.M{"$addToSet": bson.M{"read_by": userOID}},
 	)
 
@@ -259,15 +285,73 @@ func MarkAllNotificationsRead(c *fiber.Ctx) error {
 		return helper.ErrorResponse(c, fiber.StatusForbidden, "Tidak diizinkan menandai notifikasi pengguna lain")
 	}
 	userOID := authUser.ID
+	role := strings.ToLower(strings.TrimSpace(authUser.Role))
+	if role == "" {
+		role = "buyer"
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	_, _ = config.DB.Collection("notifications").UpdateMany(
 		ctx,
-		bson.M{},
+		bson.M{
+			"$or": []bson.M{
+				{"user_id": userOID},
+				{"target_role": "all"},
+				{"target_role": role},
+			},
+		},
 		bson.M{"$addToSet": bson.M{"read_by": userOID}},
 	)
 
 	return helper.SuccessResponse(c, fiber.StatusOK, "All notifications marked as read", nil)
+}
+
+// leaseReminders: status ruko milik pengguna yang perlu tindakan (menunggu verifikasi,
+// sewa hampir habis, atau sudah habis).
+func leaseReminders(ctx context.Context, u *model.User) []model.Notification {
+	out := []model.Notification{}
+	if u == nil || u.ShopID.IsZero() {
+		return out
+	}
+	s, err := loadShop(ctx, u.ShopID)
+	if err != nil || !isShopOwner(s, u.ID) {
+		return out
+	}
+	exp := s.RentalExpires.Time()
+	switch effectiveStatus(s) {
+	case "pending":
+		out = append(out, model.Notification{Type: "shop", Title: "Ruko " + s.Name + " menunggu verifikasi admin",
+			Message: "Kamu bisa menambah produk setelah ruko disetujui.", Link: "seller.html", CreatedAt: s.CreatedAt})
+	case "expired":
+		out = append(out, model.Notification{Type: "shop", Title: "Masa sewa ruko habis",
+			Message: "Produkmu disembunyikan dari katalog. Perpanjang sewa untuk berjualan lagi.", Link: "seller.html#ruko",
+			CreatedAt: s.RentalExpires})
+	case "active":
+		if left := time.Until(exp); left < 3*24*time.Hour {
+			days := int(left.Hours()/24) + 1
+			out = append(out, model.Notification{Type: "shop", Title: fmt.Sprintf("Sewa ruko berakhir dalam %d hari", days),
+				Message: "Perpanjang sekarang supaya produkmu tetap tampil di katalog.", Link: "seller.html#ruko",
+				CreatedAt: primitive.NewDateTimeFromTime(exp.Add(-3 * 24 * time.Hour))})
+		}
+	}
+	return out
+}
+
+// safeNotifLink: hanya halaman Vendora (path relatif) atau alamat https. Skema lain
+// (javascript:, data:, dsb.) dibuang supaya tautan notifikasi tidak bisa menjalankan skrip.
+func safeNotifLink(link string) string {
+	link = strings.TrimSpace(link)
+	if link == "" || strings.ContainsAny(link, " \"<>'\\") {
+		return ""
+	}
+	lower := strings.ToLower(link)
+	if strings.HasPrefix(lower, "https://") {
+		return link
+	}
+	if strings.Contains(lower, ":") || strings.HasPrefix(lower, "//") {
+		return ""
+	}
+	return link
 }
